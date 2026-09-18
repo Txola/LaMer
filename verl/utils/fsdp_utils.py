@@ -144,6 +144,10 @@ def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
         handle.flat_param_to(torch.device("cpu"), non_blocking=True)
         # the following still keeps id(._local_shard) != id(.data)
         flat_param._local_shard = flat_param.data
+        # With NO_SHARD, module tensors still view the previous flat storage.
+        # Refresh them so moving the flat parameter releases that storage.
+        if not handle.uses_sharded_strategy:
+            handle._use_unsharded_views(as_params=True)
         assert id(flat_param._local_shard) != id(flat_param.data)
     if empty_cache:
         get_torch_device().empty_cache()
@@ -175,6 +179,8 @@ def load_fsdp_model_to_gpu(model: FSDP):
         handle.flat_param_to(torch.device(f"{get_device_name()}:{device_id}"), non_blocking=True)
         # the following still keeps id(._local_shard) != id(.data)
         flat_param._local_shard = flat_param.data
+        if not handle.uses_sharded_strategy:
+            handle._use_unsharded_views(as_params=True)
 
 
 @torch.no_grad()
