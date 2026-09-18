@@ -127,10 +127,16 @@ class MineSweeperEnvironmentManager(EnvironmentManagerBase):
         else:
             thoughts, actions, valids = self.projection_f(text_actions, phase='play')
             next_obs, rewards, dones, infos = self.envs.step(actions)
+            diagnostics_config = self.config.get('trainer', {}).get('grouping_diagnostics', {})
+            capture_actions = (diagnostics_config.get('enabled', False)
+                               and self.config.get('algorithm', {}).get('adv_estimator') == 'gigpo')
 
             # add action_valid to infos
             for i, info in enumerate(infos):
                 info['is_action_valid'] = to_numpy(valids[i])
+                if capture_actions:
+                    # Preserve the parser result before actions become history strings.
+                    info['diagnostic_parsed_action'] = list(actions[i])
                 
             for i in range(self.num_processes):
                 if not valids[i]:
@@ -158,6 +164,18 @@ class MineSweeperEnvironmentManager(EnvironmentManagerBase):
 
             return next_observations, rewards, dones, infos
     
+    def get_previous_reflections(self, phase: str = 'play') -> List[List[str]]:
+        """Snapshot reflection texts included by the prompt's parse_reflection()."""
+        if (phase != 'play' or self.curr_traj_idx == 0
+                or self.reflection_type == 'history_only'):
+            return [[] for _ in range(self.num_processes)]
+        # Match parse_reflection's empty-dictionary guard and attempt order.
+        # Copy the lists before generation can add another reflection.
+        return [
+            [reflection[idx] for idx in range(self.curr_traj_idx)] if reflection else []
+            for reflection in self.reflections
+        ]
+
     def build_text_obs(self, phase: str = 'play') -> List[str]:
         """
         This function builds the text observation for the agent.

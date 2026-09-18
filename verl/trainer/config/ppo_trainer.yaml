@@ -269,6 +269,10 @@ trainer:
   log_val_generations: 0
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
+  grouping_diagnostics:
+    enabled: false
+    output_dir: diagnostics/gigpo_groups
+    cross_attempt_only: false
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1

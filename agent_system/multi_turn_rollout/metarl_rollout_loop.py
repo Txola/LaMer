@@ -332,6 +332,13 @@ class TrajectoryCollector:
         total_infos = [[] for _ in range(batch_size)]
         episode_lengths = np.zeros(batch_size, dtype=np.int32)
 
+        diagnostics_config = self.config.trainer.get('grouping_diagnostics', {})
+        capture_reflections = (
+            diagnostics_config.get('enabled', False)
+            and self.config.algorithm.adv_estimator == 'gigpo'
+            and self.config.env.env_name.lower() == 'minesweeper'
+        )
+
         phase_and_steps = []
         for attempt_idx in range(num_attempts):
             if attempt_idx == 0:
@@ -363,6 +370,12 @@ class TrajectoryCollector:
 
                 batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
 
+                if capture_reflections:
+                    previous_reflections = np.empty(batch_size, dtype=object)
+                    for i, reflections in enumerate(envs.get_previous_reflections(phase)):
+                        previous_reflections[i] = reflections
+                    batch.non_tensor_batch['previous_reflections'] = previous_reflections
+
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                 if "multi_modal_data" in batch.non_tensor_batch:
@@ -392,6 +405,19 @@ class TrajectoryCollector:
                 text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
                 
                 next_obs, rewards, dones, infos = envs.step(text_actions, phase=phase)
+
+                if capture_reflections:
+                    # These describe the action just executed. anchor_obs and
+                    # previous_reflections describe its pre-generation state.
+                    for field, values in {
+                        'parsed_action': [info.get('diagnostic_parsed_action') for info in infos],
+                        'action_is_effective': [info.get('action_is_effective') for info in infos],
+                        'next_anchor_obs': next_obs['anchor'] if phase == 'play' else [None] * batch_size,
+                    }.items():
+                        metadata = np.empty(batch_size, dtype=object)
+                        for i, value in enumerate(values):
+                            metadata[i] = value
+                        batch.non_tensor_batch[field] = metadata
                 
                 if len(rewards.shape) == 2:
                     rewards = rewards.squeeze(1)

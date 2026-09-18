@@ -1244,6 +1244,20 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                         )
 
+                    diagnostics_config = self.config.trainer.get("grouping_diagnostics", {})
+                    if (diagnostics_config.get("enabled", False)
+                            and self.config.algorithm.adv_estimator == "gigpo"
+                            and self.config.env.env_name.lower() == "minesweeper"):
+                        from verl.trainer.ppo.grouping_diagnostics import dump_gigpo_groups
+
+                        diagnostics_path = dump_gigpo_groups(
+                            batch,
+                            output_dir=diagnostics_config["output_dir"],
+                            step=self.global_steps,
+                            cross_attempt_only=diagnostics_config.get("cross_attempt_only", False),
+                        )
+                        print(f"GiGPO grouping diagnostics written before actor update: {diagnostics_path}", flush=True)
+
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
