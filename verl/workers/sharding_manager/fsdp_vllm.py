@@ -167,15 +167,41 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         get_torch_device().empty_cache()
 
         log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
+        cpu_unsharded_actor = False
         if self.offload_param:
-            load_fsdp_model_to_gpu(self.module)
+            # NO_SHARD state_dict() clones full weights. Keep an offloaded
+            # actor on CPU so those clones do not compete with vLLM for VRAM.
+            if (fsdp_version(self.module) == 1
+                    and not isinstance(self.module._fsdp_wrapped_module, PeftModel)
+                    and all(not handle.uses_sharded_strategy
+                            for handle in self.module._all_handles)):
+                offload_fsdp_model_to_cpu(self.module)
+                cpu_unsharded_actor = True
+            else:
+                load_fsdp_model_to_gpu(self.module)
 
         peft_config = None
         if isinstance(self.module._fsdp_wrapped_module, PeftModel):
             peft_config = self.module._fsdp_wrapped_module.peft_config.get('default', None)
             params = __collect_lora_params()
         else:
-            params = self.module.state_dict()
+            if cpu_unsharded_actor:
+                # Borrow CPU parameter views for this synchronous transfer.
+                # The actor is not updated until update_params() completes;
+                # cloning these views would duplicate the full FP32 model.
+                # FSDP.state_dict() would move them back to CUDA instead.
+                params = OrderedDict(
+                    (name.replace("_fsdp_wrapped_module.", ""), param.detach())
+                    for name, param in self.module.named_parameters(remove_duplicate=False)
+                    if name.split(".")[-1] != "_flat_param"
+                )
+                for module_name, module in self.module.named_modules():
+                    for name, buffer in module._buffers.items():
+                        if buffer is not None and name not in module._non_persistent_buffers_set:
+                            key = f"{module_name}.{name}" if module_name else name
+                            params[key.replace("_fsdp_wrapped_module.", "")] = buffer.detach().cpu().clone()
+            else:
+                params = self.module.state_dict()
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
 
         # Copy, not share memory
