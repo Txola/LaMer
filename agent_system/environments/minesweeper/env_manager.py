@@ -225,8 +225,23 @@ def make_envs(config):
             "board_size": config.env.minesweeper.board_size,  # e.g., 8 for 8x8 board
             "n_mines": config.env.minesweeper.n_mines,
         }
-        _envs = build_minesweeper_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_kwargs=env_kwargs)
-        _val_envs = build_minesweeper_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_kwargs=env_kwargs)
+        execution_backend = config.env.minesweeper.get('execution_backend', 'ray')
+        _envs = build_minesweeper_envs(
+            seed=config.env.seed,
+            env_num=config.data.train_batch_size,
+            group_n=group_n,
+            is_train=True,
+            env_kwargs=env_kwargs,
+            execution_backend=execution_backend,
+        )
+        _val_envs = build_minesweeper_envs(
+            seed=config.env.seed + 1000,
+            env_num=config.data.val_batch_size,
+            group_n=1,
+            is_train=False,
+            env_kwargs=env_kwargs,
+            execution_backend=execution_backend,
+        )
         
         num_attempts = config.env.get('num_attempts', 1)
         do_reflection = config.env.get('do_reflection', True)
