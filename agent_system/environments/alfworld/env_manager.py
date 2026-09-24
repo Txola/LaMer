@@ -305,7 +305,8 @@ def make_envs(config):
             raise ValueError(f"Unsupported environment: {config.env.env_name}")
 
         env_kwargs = {
-            'eval_dataset': config.env.alfworld.get('eval_dataset', 'eval_all'), # 'eval_in_distribution' or 'eval_out_of_distribution' or 'eval_all'
+            # eval_all is the fixed checkpoint subset; eval_full is all held-out games.
+            'eval_dataset': config.env.alfworld.get('eval_dataset', 'eval_all'),
         }
         _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs)
         _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs)

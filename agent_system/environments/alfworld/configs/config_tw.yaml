@@ -1,8 +1,9 @@
 dataset:
   data_path: '$ALFWORLD_DATA/json/train_first4'
-  eval_id_data_path: '$ALFWORLD_DATA/json/valid_first4'    # null/None to disable
-  eval_ood_data_path: '$ALFWORLD_DATA/json/valid_last2' # null/None to disable
-  eval_all_data_path: '$ALFWORLD_DATA/json/valid_all' # null/None to disable
+  eval_id_data_path: '$ALFWORLD_DATA/json/valid_first4' # valid_train + valid_seen
+  eval_ood_data_path: '$ALFWORLD_DATA/json/valid_last2' # valid_train + valid_seen
+  eval_all_data_path: '$ALFWORLD_DATA/json/valid_task_balanced126' # 21 per task
+  eval_full_data_path: '$ALFWORLD_DATA/json/valid_all' # all 340 held-out games
   num_train_games: -1                                          # max training games (<=0 indicates full dataset)
   num_eval_games: -1                                           # max evaluation games (<=0 indicates full dataset)
   

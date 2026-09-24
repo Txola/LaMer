@@ -142,6 +142,10 @@ class AlfredTWEnv(object):
             data_path = os.path.expandvars(self.config['dataset']['eval_ood_data_path'])
         elif self.train_eval == 'eval_all':
             data_path = os.path.expandvars(self.config['dataset']['eval_all_data_path'])
+        elif self.train_eval == 'eval_full':
+            data_path = os.path.expandvars(self.config['dataset']['eval_full_data_path'])
+        else:
+            raise ValueError(f"Unknown ALFWorld split: {self.train_eval}")
 
         log("Collecting solvable games...")
 

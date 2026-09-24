@@ -44,7 +44,13 @@ class AlfworldWorker:
     Each actor holds one environment instance.
     """
     
-    def __init__(self, config, seed, base_env):
+    def __init__(self, config, seed, base_env, game_file=None):
+        # Evaluation workers receive a singleton pool so every reset uses the
+        # same assigned game. This prevents duplicate sampling across workers
+        # and keeps checkpoint comparisons on an identical task set.
+        if game_file is not None:
+            base_env.game_files = [game_file]
+            base_env.num_games = 1
         self.env = base_env.init_env(batch_size=1)  # Each worker holds only one sub-environment
         self.env.seed(seed)
     
@@ -93,10 +99,26 @@ class AlfworldEnvs(gym.Env):
         self.num_processes = env_num * group_n
         self.group_n = group_n
 
+        evaluation_games = None
+        if not is_train:
+            if env_num > len(base_env.game_files):
+                raise ValueError(
+                    f"Requested {env_num} distinct evaluation games, but "
+                    f"the selected pool contains only {len(base_env.game_files)}"
+                )
+            rng = np.random.RandomState(seed)
+            indices = rng.permutation(len(base_env.game_files))[:env_num]
+            evaluation_games = [base_env.game_files[index] for index in indices]
+
         # Create Ray remote actors instead of processes
         self.workers = []
         for i in range(self.num_processes):
-            worker = AlfworldWorker.remote(config, seed + (i // self.group_n), base_env)
+            game_file = None
+            if evaluation_games is not None:
+                game_file = evaluation_games[i // self.group_n]
+            worker = AlfworldWorker.remote(
+                config, seed + (i // self.group_n), base_env, game_file
+            )
             self.workers.append(worker)
 
         self.prev_admissible_commands = [None for _ in range(self.num_processes)]

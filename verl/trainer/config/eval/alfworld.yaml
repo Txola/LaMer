@@ -12,7 +12,7 @@ data:
   n_samples: 5
   output_path: outputs
   train_batch_size: 1
-  val_batch_size: 128
+  val_batch_size: 126 # fixed checkpoint set: 21 games per task type
   trust_remote_code: False  # main_ppo will check this config to determine whether to use remote code for tokenizer
   custom_cls:
       path: null
@@ -127,4 +127,4 @@ env:
   rollout:
     n: 1
   alfworld:
-    eval_dataset: eval_all # eval_in_distribution
+    eval_dataset: eval_all # use eval_full with val_batch_size=340 for final evaluation

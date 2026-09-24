@@ -2,7 +2,7 @@ set -x
 ENGINE=${1:-vllm}
 
 train_data_size=8
-val_data_size=128
+val_data_size=126 # 21 fixed games from each of the six task types
 group_size=24
 mode="mean_norm" # "mean_norm" or "mean_std_norm"
 
