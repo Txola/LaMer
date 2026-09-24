@@ -430,6 +430,14 @@ class TrajectoryCollector:
                 else:
                     batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
 
+                if capture_reflections:
+                    # Preserve the immediate transition outcome for validation and
+                    # grouping diagnostics. These are CPU/non-tensor metadata.
+                    batch.non_tensor_batch['action_done'] = np.asarray(dones, dtype=bool)
+                    batch.non_tensor_batch['action_won'] = np.asarray(
+                        [info.get('won', False) for info in infos], dtype=bool
+                    )
+
                 # episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
                 episode_lengths[active_masks] += 1
 

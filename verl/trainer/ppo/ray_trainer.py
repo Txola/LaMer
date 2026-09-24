@@ -52,6 +52,11 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.trainer.ppo.validation_diagnostics import (
+    collect_validation_interactions,
+    dump_validation_interactions,
+    summarize_validation_interactions,
+)
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import (
     reduce_metrics,
@@ -719,6 +724,8 @@ class RayPPOTrainer:
         reward_tensor_lst = []
         data_source_lst = []
         success_rate_dict = {}
+        validation_data_dir = self.config.trainer.get('validation_data_dir', None)
+        validation_interactions = []
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -780,6 +787,10 @@ class RayPPOTrainer:
             print('validation generation end')
             del test_batch
             test_batch = test_output_gen_batch
+            if validation_data_dir:
+                validation_interactions.extend(
+                    collect_validation_interactions(test_batch, self.tokenizer)
+                )
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
@@ -827,6 +838,20 @@ class RayPPOTrainer:
 
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
+
+        if validation_data_dir:
+            diagnostic_summary = summarize_validation_interactions(validation_interactions)
+            metric_dict.update(diagnostic_summary['metrics'])
+            interactions_path, summary_path = dump_validation_interactions(
+                records=validation_interactions,
+                summary=diagnostic_summary,
+                dump_path=validation_data_dir,
+                global_step=self.global_steps,
+            )
+            print(
+                'Validation interaction diagnostics written to '
+                f'{interactions_path} and {summary_path}'
+            )
 
         print(metric_dict)
         return metric_dict
@@ -982,20 +1007,34 @@ class RayPPOTrainer:
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
-        # load actor
-        self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+        val_only = self.config.trainer.get("val_only", False)
+        # Evaluation needs policy weights only. Skipping Adam, scheduler, saved
+        # training RNG, and dataloader state saves RAM/I/O and keeps the
+        # checkpoint comparison on a common evaluation RNG stream.
+        if val_only and self.config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
+            self.actor_rollout_wg.load_checkpoint(
+                actor_path,
+                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+                load_training_state=False,
+            )
+        else:
+            self.actor_rollout_wg.load_checkpoint(
+                actor_path,
+                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+            )
         # load critic
-        if self.use_critic:
+        if self.use_critic and not val_only:
             self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
         # load dataloader,
         # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
-        else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        if not val_only:
+            dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+            if os.path.exists(dataloader_local_path):
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
+            else:
+                print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
