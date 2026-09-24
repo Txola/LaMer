@@ -35,7 +35,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
-from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
+from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager, FSDPLoraCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
@@ -582,13 +582,32 @@ class ActorRolloutRefWorker(Worker):
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
-            self.checkpoint_manager = FSDPCheckpointManager(
-                model=self.actor_module_fsdp,
-                optimizer=self.actor.actor_optimizer,
-                lr_scheduler=self.actor_lr_scheduler,
-                processing_class=self.processor if self.processor is not None else self.tokenizer,
-                checkpoint_contents=self.config.actor.checkpoint.contents,
-            )
+            self._save_lora_only = self.config.actor.checkpoint.get("save_lora_only", False)
+            if self._save_lora_only:
+                if not self._is_lora:
+                    raise ValueError("actor.checkpoint.save_lora_only=True requires model.lora_rank > 0")
+                self.checkpoint_manager = FSDPLoraCheckpointManager(
+                    model=self.actor_module_fsdp,
+                    optimizer=self.actor.actor_optimizer,
+                    lr_scheduler=self.actor_lr_scheduler,
+                    processing_class=self.processor if self.processor is not None else self.tokenizer,
+                    checkpoint_metadata={
+                        "base_model_path": str(self.config.model.path),
+                        "model_type": self.actor_model_config.model_type,
+                        "model_commit": getattr(self.actor_model_config, "_commit_hash", None),
+                        "lora_rank": self._lora_rank,
+                        "lora_alpha": self.config.model.lora_alpha,
+                        "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                    },
+                )
+            else:
+                self.checkpoint_manager = FSDPCheckpointManager(
+                    model=self.actor_module_fsdp,
+                    optimizer=self.actor.actor_optimizer,
+                    lr_scheduler=self.actor_lr_scheduler,
+                    processing_class=self.processor if self.processor is not None else self.tokenizer,
+                    checkpoint_contents=self.config.actor.checkpoint.contents,
+                )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
@@ -771,13 +790,16 @@ class ActorRolloutRefWorker(Worker):
         # only support save and load ckpt for actor
         assert self._is_actor
 
-        if self._is_offload_param:
+        # LoRA-only checkpoints are written directly from the already-offloaded
+        # CPU parameters. Loading the frozen base model onto CUDA here caused
+        # the following vLLM wake-up to OOM on a 24 GB single-GPU setup.
+        if self._is_offload_param and not self._save_lora_only:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep)
         dist.barrier()
 
-        if self._is_lora and isinstance(self.actor_module, PeftModel):
+        if not self._save_lora_only and self._is_lora and isinstance(self.actor_module, PeftModel):
             lora_save_path = os.path.join(local_path, "lora_adapter")
             peft_config = {}
             if dist.get_rank() == 0:
@@ -802,20 +824,35 @@ class ActorRolloutRefWorker(Worker):
             if dist.get_rank() == 0:
                 print(f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}")
 
-        if self._is_offload_param:
+        if self._is_offload_param and not self._save_lora_only:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        elif self._save_lora_only:
+            get_torch_device().empty_cache()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
-        if self._is_offload_param:
+    def load_checkpoint(
+        self,
+        local_path,
+        hdfs_path=None,
+        del_local_after_load=False,
+        load_training_state=True,
+    ):
+        lora_model_path = os.path.join(local_path, f"lora_model_world_size_{dist.get_world_size()}_rank_{dist.get_rank()}.pt")
+        is_lora_only_checkpoint = self._save_lora_only and os.path.exists(lora_model_path)
+        if self._is_offload_param and not is_lora_only_checkpoint:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
+        self.checkpoint_manager.load_checkpoint(
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            del_local_after_load=del_local_after_load,
+            load_training_state=load_training_state,
+        )
 
-        if self._is_offload_param:
+        if self._is_offload_param and not is_lora_only_checkpoint:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
-        if self._is_offload_optimizer:
+        if load_training_state and self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
 
 

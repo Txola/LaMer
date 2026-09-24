@@ -66,6 +66,9 @@ actor_rollout_ref:
     ulysses_sequence_parallel_size: 1 # sp size
     checkpoint:
       contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
+      # Reload the frozen base model from model.path and checkpoint only LoRA
+      # parameters plus optimizer/scheduler/RNG state. Requires lora_rank > 0.
+      save_lora_only: False
     optim:
       lr: 1e-6
       lr_warmup_steps: -1 # Prioritized. Negative values mean delegating to lr_warmup_steps_ratio.
