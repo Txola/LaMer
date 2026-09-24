@@ -112,6 +112,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __enter__(self):
+        wrapped_module = self.module._fsdp_wrapped_module if fsdp_version(self.module) == 1 else self.module
+
         def __collect_lora_params()->OrderedDict:
             """
             collect lora params or full params if base model is not ready in vllm
@@ -128,11 +130,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 else:
                     with FSDP.summon_full_params(self.module, writeback=False):
                         if self.base_sync_done:
-                            lora_params = get_peft_model_state_dict(self.module._fsdp_wrapped_module)
+                            lora_params = get_peft_model_state_dict(wrapped_module)
                             lora_params = {name: param.full_tensor().detach().cpu() if hasattr(param, 'full_tensor') else param.detach().cpu() 
                                         for name, param in lora_params.items()}
                         else:
-                            model = self.module._fsdp_wrapped_module.base_model.model
+                            model = wrapped_module.base_model.model
                             orig_dev = 'cpu' if 'cpu' in next(model.parameters()).device.type else 'cuda'
                             model = model.to('cpu')
                             for name, param in model.state_dict().items():
@@ -144,9 +146,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     torch.cuda.empty_cache()
             else:
                 if self.base_sync_done:
-                    lora_params = get_peft_model_state_dict(self.module._fsdp_wrapped_module)
+                    lora_params = get_peft_model_state_dict(wrapped_module)
                 else:
-                    model = self.module._fsdp_wrapped_module.base_model.model
+                    model = wrapped_module.base_model.model
                     orig_dev = 'cpu' if 'cpu' in next(model.parameters()).device.type else 'cuda'
                     model = model.to('cpu')
                     for name, param in model.state_dict().items():
@@ -172,7 +174,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             # NO_SHARD state_dict() clones full weights. Keep an offloaded
             # actor on CPU so those clones do not compete with vLLM for VRAM.
             if (fsdp_version(self.module) == 1
-                    and not isinstance(self.module._fsdp_wrapped_module, PeftModel)
+                    and not isinstance(wrapped_module, PeftModel)
                     and all(not handle.uses_sharded_strategy
                             for handle in self.module._all_handles)):
                 offload_fsdp_model_to_cpu(self.module)
@@ -181,9 +183,14 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 load_fsdp_model_to_gpu(self.module)
 
         peft_config = None
-        if isinstance(self.module._fsdp_wrapped_module, PeftModel):
-            peft_config = self.module._fsdp_wrapped_module.peft_config.get('default', None)
+        if isinstance(wrapped_module, PeftModel):
+            peft_config = wrapped_module.peft_config.get('default', None)
             params = __collect_lora_params()
+            if self.base_sync_done and not params:
+                raise RuntimeError(
+                    "LoRA synchronization produced no adapter tensors; "
+                    "refusing to run vLLM with the unchanged base model"
+                )
         else:
             if cpu_unsharded_actor:
                 # Borrow CPU parameter views for this synchronous transfer.

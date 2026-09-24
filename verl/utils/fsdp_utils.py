@@ -468,6 +468,25 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
 def layered_summon_lora_params(fsdp_module)->OrderedDict:
     from peft.utils.save_and_load import get_peft_model_state_dict
 
+    # On a one-rank FSDP1 job PyTorch replaces FULL_SHARD with NO_SHARD.  In
+    # that layout each LoRA leaf is itself FSDP-wrapped, and passing a parent
+    # layer state_dict through get_peft_model_state_dict() can return an empty
+    # mapping.  The unsharded parameter views are already complete tensors, so
+    # collect those views directly and normalize their names to the regular
+    # PEFT adapter format expected by vLLM.
+    if fsdp_version(fsdp_module) == 1 and all(
+        not handle.uses_sharded_strategy for handle in fsdp_module._all_handles
+    ):
+        lora_params = OrderedDict()
+        for name, param in fsdp_module.named_parameters(remove_duplicate=False):
+            if "lora_" not in name or name.endswith("._flat_param"):
+                continue
+            adapter_name = name.replace("_fsdp_wrapped_module.", "")
+            adapter_name = adapter_name.replace(".lora_A.default.", ".lora_A.")
+            adapter_name = adapter_name.replace(".lora_B.default.", ".lora_B.")
+            lora_params[adapter_name] = param.detach().cpu()
+        return lora_params
+
     def __prefix_submodules(module, prefix):
         for name, submodule in module.named_modules():
             if name.startswith(prefix) and "." not in name[len(prefix):]:
