@@ -7,11 +7,13 @@ cd "$REPO_ROOT"
 
 TASK_COUNT=${TASK_COUNT:-16}
 VAL_TASK_COUNT=${VAL_TASK_COUNT:-1}
+TOTAL_STEPS=${TOTAL_STEPS:-1}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-4}
+LEARNING_RATE=${LEARNING_RATE:-1e-6}
 LORA_RANK=${LORA_RANK:-32}
 LORA_ALPHA=${LORA_ALPHA:-64}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B}
-OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/diagnostics/lora_update_test/tasks_${TASK_COUNT}_micro_${MICRO_BATCH_SIZE}_$(date -u +%Y%m%dT%H%M%S_%N)"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/diagnostics/lora_update_test/tasks_${TASK_COUNT}_steps_${TOTAL_STEPS}_micro_${MICRO_BATCH_SIZE}_$(date -u +%Y%m%dT%H%M%S_%N)"}
 
 case "$MICRO_BATCH_SIZE" in
     1|2|4|8|16|32|64) ;;
@@ -46,7 +48,7 @@ python3 -m verl.trainer.main_ppo \
     "actor_rollout_ref.model.lora_rank=$LORA_RANK" \
     "actor_rollout_ref.model.lora_alpha=$LORA_ALPHA" \
     actor_rollout_ref.model.target_modules=all-linear \
-    actor_rollout_ref.actor.optim.lr=1e-5 \
+    "actor_rollout_ref.actor.optim.lr=$LEARNING_RATE" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
     "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE" \
@@ -103,8 +105,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=1 \
-    trainer.total_training_steps=1 \
+    "trainer.total_epochs=$TOTAL_STEPS" \
+    "trainer.total_training_steps=$TOTAL_STEPS" \
     trainer.resume_mode=disable \
     trainer.val_before_train=False \
     trainer.grouping_diagnostics.enabled=False \
