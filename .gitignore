@@ -1,0 +1,48 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Local Python environments and build products
+.venv/
+/venv/
+/env/
+build/
+dist/
+*.egg-info/
+
+# LaMer experiment outputs
+/outputs/
+/diagnostics/
+checkpoints/
+global_step_*/
+.hydra/
+multirun/
+wandb/
+ray_results/
+
+# Prepared datasets and checkpoint payloads
+*.parquet
+*.ckpt
+*.safetensors
+pytorch_model*.bin
+model_world_size_*.pt
+lora_model_world_size_*.pt
+optim_world_size_*.pt
+extra_state_world_size_*.pt
+data.pt
+
+# Runtime logs and process files
+*.log
+*.pid
+
+# Editor and operating-system files
+*.swp
+*.swo
+.DS_Store
