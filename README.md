@@ -24,6 +24,7 @@ To train the LLM Agent with RL baselines:
 bash examples/minesweeper/gigpo_minesweeper_qwen3_4b.sh
 ```
 See the `examples` folder for more examples. 
+For the tested single-GPU LoRA, checkpoint evaluation, and diagnostic settings, see [working configurations](docs/WORKING_CONFIGURATIONS.md).
 
 </br>
 <div align="left" style="padding: 0 0pt">
