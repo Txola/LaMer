@@ -182,6 +182,124 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     return metrics
 
 
+def compute_gigpo_group_metrics(batch: DataProto) -> Dict[str, float]:
+    """Summarize whether GiGPO rollout groups contain a useful outcome signal.
+
+    A relative group update is least informative when every sampled rollout for
+    a task either fails or succeeds. Rollout records contain many actions (and
+    may contain padding copies), so outcomes are first collapsed by trajectory
+    id and then grouped by the task-level uid.
+    """
+    metadata = batch.non_tensor_batch
+    required = ("uid", "traj_uid", "episode_rewards")
+    if any(key not in metadata for key in required):
+        return {}
+
+    rollout_groups: dict[Any, dict[Any, bool]] = defaultdict(dict)
+    for uid, traj_uid, reward in zip(
+        metadata["uid"], metadata["traj_uid"], metadata["episode_rewards"]
+    ):
+        reward_values = np.asarray(reward, dtype=np.float64).reshape(-1)
+        succeeded = bool(np.any(reward_values > 0.0))
+        previous = rollout_groups[uid].get(traj_uid, False)
+        rollout_groups[uid][traj_uid] = previous or succeeded
+
+    outcomes = [list(group.values()) for group in rollout_groups.values() if group]
+    if not outcomes:
+        return {}
+
+    group_sizes = np.asarray([len(group) for group in outcomes], dtype=np.float64)
+    success_counts = np.asarray([sum(group) for group in outcomes], dtype=np.float64)
+    all_failure = success_counts == 0
+    all_success = success_counts == group_sizes
+    mixed = ~(all_failure | all_success)
+
+    metrics = {
+        "gigpo/groups/count": float(len(outcomes)),
+        "gigpo/groups/size_mean": float(group_sizes.mean()),
+        "gigpo/groups/size_min": float(group_sizes.min()),
+        "gigpo/groups/size_max": float(group_sizes.max()),
+        "gigpo/groups/mixed_outcome_fraction": float(mixed.mean()),
+        "gigpo/groups/all_failure_fraction": float(all_failure.mean()),
+        "gigpo/groups/all_success_fraction": float(all_success.mean()),
+        "gigpo/groups/successful_rollouts_mean": float(success_counts.mean()),
+        "gigpo/groups/successful_rollouts_std": float(success_counts.std()),
+    }
+
+    if "advantages" in batch.batch and "response_mask" in batch.batch:
+        valid_advantages = torch.masked_select(
+            batch.batch["advantages"], batch.batch["response_mask"].bool()
+        )
+        if valid_advantages.numel():
+            metrics.update({
+                "gigpo/advantages/nonzero_token_fraction": float(
+                    (valid_advantages.abs() > 1e-8).float().mean().detach().item()
+                ),
+                "gigpo/advantages/absolute_mean": float(
+                    valid_advantages.abs().mean().detach().item()
+                ),
+                "gigpo/advantages/std": float(
+                    valid_advantages.std(unbiased=False).detach().item()
+                ),
+            })
+
+    return metrics
+
+
+def compute_meta_rl_validation_metrics(
+    success_rates: Dict[str, float],
+) -> Dict[str, float]:
+    """Add readable p@k, cross-attempt gains, and ID/OOD macro averages."""
+    metrics: dict[str, float] = {}
+
+    def add_attempt_curve(prefix: str, values: list[float]) -> None:
+        if not values:
+            return
+        for attempt, value in enumerate(values, start=1):
+            metrics[f"val/meta_rl/{prefix}p_at_{attempt}"] = float(value)
+            if attempt > 1:
+                metrics[f"val/meta_rl/{prefix}gain_attempt_{attempt}"] = float(
+                    value - values[attempt - 2]
+                )
+                metrics[f"val/meta_rl/{prefix}gain_over_first_at_{attempt}"] = float(
+                    value - values[0]
+                )
+
+    overall = []
+    attempt = 0
+    while f"success_rate[{attempt}]" in success_rates:
+        overall.append(float(success_rates[f"success_rate[{attempt}]"]))
+        attempt += 1
+    add_attempt_curve("", overall)
+
+    task_sets = {
+        "id_": (
+            "pick_and_place_simple",
+            "look_at_obj_in_light",
+            "pick_clean_then_place_in_recep",
+            "pick_heat_then_place_in_recep",
+        ),
+        "ood_": (
+            "pick_cool_then_place_in_recep",
+            "pick_two_obj_and_place",
+        ),
+    }
+    for prefix, task_types in task_sets.items():
+        values = []
+        for attempt in range(len(overall)):
+            task_values = [
+                float(success_rates[f"{task_type}|success_rate[{attempt}]"])
+                for task_type in task_types
+                if f"{task_type}|success_rate[{attempt}]" in success_rates
+            ]
+            if len(task_values) != len(task_types):
+                break
+            values.append(float(np.mean(task_values)))
+        add_attempt_curve(prefix, values)
+
+    return metrics
+
+
 def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.

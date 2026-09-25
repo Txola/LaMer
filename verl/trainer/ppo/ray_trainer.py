@@ -47,6 +47,8 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_gigpo_group_metrics,
+    compute_meta_rl_validation_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -694,7 +696,11 @@ class RayPPOTrainer:
     def _maybe_log_val_trajectory(self, traj_cot_logs):
         """ Log validation trajectory """
         generations_to_log = self.config.trainer.log_val_generations
-            
+
+        if generations_to_log <= 0 or not traj_cot_logs:
+            return
+        generations_to_log = min(generations_to_log, len(traj_cot_logs))
+
         print('#### Trajectory CoT logging ####')
         for idx in range(generations_to_log):
             traj_cot_log = traj_cot_logs[idx]
@@ -721,6 +727,72 @@ class RayPPOTrainer:
             # Update reference and log
             wandb.log({"val/cot_trajectory": new_table}, step=self.global_steps)
             self.val_table_traj_cot = new_table
+
+    def _maybe_log_validation_learning_chart(self, metric_dict):
+        """Log a single W&B chart tracking validation success across attempts."""
+        if 'wandb' not in self.config.trainer.logger:
+            return
+
+        metric_keys = (
+            'val/meta_rl/p_at_1',
+            'val/meta_rl/p_at_2',
+            'val/meta_rl/p_at_3',
+        )
+        if any(key not in metric_dict for key in metric_keys):
+            return
+
+        try:
+            import wandb
+
+            if not hasattr(self, '_validation_learning_history'):
+                self._validation_learning_history = {}
+                validation_data_dir = self.config.trainer.get(
+                    'validation_data_dir', None
+                )
+                if validation_data_dir and os.path.isdir(validation_data_dir):
+                    for filename in os.listdir(validation_data_dir):
+                        if not (
+                            filename.startswith('step_')
+                            and filename.endswith('_metrics.json')
+                        ):
+                            continue
+                        try:
+                            step = int(filename[len('step_'):-len('_metrics.json')])
+                            with open(
+                                os.path.join(validation_data_dir, filename),
+                                'r',
+                                encoding='utf-8',
+                            ) as metrics_file:
+                                stored_metrics = json.load(metrics_file)
+                            if all(key in stored_metrics for key in metric_keys):
+                                self._validation_learning_history[step] = [
+                                    float(stored_metrics[key]) for key in metric_keys
+                                ]
+                        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                            continue
+
+            self._validation_learning_history[self.global_steps] = [
+                float(metric_dict[key]) for key in metric_keys
+            ]
+            steps = sorted(self._validation_learning_history)
+            chart = wandb.plot.line_series(
+                xs=steps,
+                ys=[
+                    [self._validation_learning_history[step][attempt] for step in steps]
+                    for attempt in range(len(metric_keys))
+                ],
+                keys=['P@1', 'P@2', 'P@3'],
+                title='ALFWorld validation success',
+                xname='Optimization step',
+            )
+            # The regular metric logger commits this step immediately after validation.
+            wandb.log(
+                {'learning/validation_success': chart},
+                step=self.global_steps,
+                commit=False,
+            )
+        except Exception as exc:
+            print(f'Warning: failed to log W&B validation learning chart: {exc}')
 
     def _validate(self):
         reward_tensor_lst = []
@@ -863,6 +935,7 @@ class RayPPOTrainer:
 
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
+        metric_dict.update(compute_meta_rl_validation_metrics(success_rate))
 
         if validation_data_dir:
             diagnostic_summary = summarize_validation_interactions(validation_interactions)
@@ -896,6 +969,7 @@ class RayPPOTrainer:
                 + (f' and {interactions_path}' if interactions_path else '')
             )
 
+        self._maybe_log_validation_learning_chart(metric_dict)
         print(metric_dict)
         return metric_dict
 
@@ -1360,6 +1434,8 @@ class RayPPOTrainer:
                             step_advantage_w=self.config.algorithm.gigpo.step_advantage_w,
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                         )
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
+                            metrics.update(compute_gigpo_group_metrics(batch))
 
                     diagnostics_config = self.config.trainer.get("grouping_diagnostics", {})
                     if (diagnostics_config.get("enabled", False)
