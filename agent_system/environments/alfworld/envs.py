@@ -37,6 +37,26 @@ def compute_reward(info, multi_modal=False):
         reward = 10.0 * float(info['won'])
     return reward
 
+
+def repeated_shuffled_game_cycle(gamefiles, repeats, seed):
+    """Yield each shuffled game ``repeats`` times before advancing.
+
+    TextWorld normally selects one new game per batch slot. GiGPO instead needs
+    every slot in a rollout group to start from the same game, with a new game
+    selected for the group on its next reset.
+    """
+    if repeats <= 0:
+        raise ValueError("repeats must be positive")
+    gamefiles = list(gamefiles)
+    if not gamefiles:
+        raise ValueError("gamefiles must not be empty")
+    rng = np.random.RandomState(seed)
+    while True:
+        rng.shuffle(gamefiles)
+        for gamefile in gamefiles:
+            for _ in range(repeats):
+                yield gamefile
+
 @ray.remote
 class AlfworldWorker:
     """
@@ -44,16 +64,29 @@ class AlfworldWorker:
     Each actor holds one environment instance.
     """
     
-    def __init__(self, config, seed, base_env, game_files=None):
+    def __init__(
+        self,
+        config,
+        seed,
+        base_env,
+        game_files=None,
+        batch_size=1,
+        repeat_game_within_batch=False,
+    ):
         # Evaluation workers receive a fixed game pool whose size equals their
         # internal batch. Every game is therefore loaded exactly once, while a
         # small number of Ray processes can host the complete evaluation set.
         if game_files is not None:
             base_env.game_files = list(game_files)
             base_env.num_games = len(game_files)
-        batch_size = len(game_files) if game_files is not None else 1
+            batch_size = len(game_files)
+        self.batch_size = batch_size
         self.env = base_env.init_env(batch_size=batch_size)
         self.env.seed(seed)
+        if repeat_game_within_batch:
+            self.env._gamefiles_iterator = repeated_shuffled_game_cycle(
+                self.env.gamefiles, repeats=batch_size, seed=seed
+            )
     
     def step(self, actions):
         """Execute a step in the environment"""
@@ -75,7 +108,7 @@ class AlfworldWorker:
     
     def restart(self):
         '''Get back to init state of the game'''
-        self.env.last_commands = [None]
+        self.env.last_commands = [None] * self.batch_size
         self.env.obs, infos = self.env.batch_env.reset()
 
         obs = self.env.obs
@@ -114,27 +147,38 @@ class AlfworldEnvs(gym.Env):
             indices = rng.permutation(len(base_env.game_files))[:env_num]
             evaluation_games = [base_env.game_files[index] for index in indices]
 
-        # Evaluation batches use a few synchronous TextWorld environments per
-        # Ray actor. This avoids one heavyweight Python/Ray process per game.
+        # Training uses one Ray actor per task group. Each actor hosts the
+        # group's rollouts as a synchronous TextWorld batch and repeats the
+        # selected game across every batch slot. This preserves GiGPO grouping
+        # without paying for one Python/Ray process per rollout.
         if evaluation_games is None:
-            worker_game_batches = [None for _ in range(self.num_processes)]
+            config['env']['textworld_asynchronous'] = False
+            worker_specs = [
+                (None, self.group_n, True) for _ in range(env_num)
+            ]
         else:
             config['env']['textworld_asynchronous'] = False
-            worker_game_batches = [
-                evaluation_games[start:start + self.games_per_worker]
+            worker_specs = [
+                (evaluation_games[start:start + self.games_per_worker], None, False)
                 for start in range(0, len(evaluation_games), self.games_per_worker)
             ]
 
         self.workers = []
         self.worker_sizes = []
         game_offset = 0
-        for game_files in worker_game_batches:
-            worker_size = len(game_files) if game_files is not None else 1
+        for worker_index, (game_files, batch_size, repeat_game) in enumerate(worker_specs):
+            worker_size = len(game_files) if game_files is not None else batch_size
+            worker_seed = seed + (game_offset if game_files is not None else worker_index)
             worker = AlfworldWorker.options(
                 num_cpus=self.num_cpus_per_worker,
                 num_gpus=self.num_gpus_per_worker,
             ).remote(
-                config, seed + game_offset, base_env, game_files
+                config,
+                worker_seed,
+                base_env,
+                game_files,
+                worker_size,
+                repeat_game,
             )
             self.workers.append(worker)
             self.worker_sizes.append(worker_size)
