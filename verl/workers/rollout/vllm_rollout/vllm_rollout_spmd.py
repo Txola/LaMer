@@ -69,6 +69,7 @@ class vLLMRollout(BaseRollout):
         super().__init__()
         self.config = config
         self.tokenizer = tokenizer
+        self.model_path = model_path
 
         assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
 
@@ -425,6 +426,7 @@ class vLLMRollout(BaseRollout):
         # Must n==1
 
         lora_requests = None
+        lora_int_ids = []
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
             if len(lora_int_ids) > 0:
@@ -433,6 +435,7 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            resolved_sampling_params = repr(self.sampling_params)
             '''Just do not do rollout on examples that are not active'''
             outputs = self.inference_engine.generate(
                 prompts=[_vllm_inputs for _vllm_inputs, active_mask in zip(vllm_inputs, active_masks) if active_mask],  # because we have already convert it to prompt token id
@@ -444,6 +447,8 @@ class vLLMRollout(BaseRollout):
             # n=1 for agent setting!
             response = []
             rollout_log_probs = []
+            finish_reasons = []
+            stop_reasons = []
 
             curr_idx = 0
             for active in active_masks:
@@ -455,10 +460,14 @@ class vLLMRollout(BaseRollout):
                     for i, logprob in enumerate(output.outputs[0].logprobs):
                         curr_log_prob.append(logprob[response_ids[i]].logprob)
                     rollout_log_probs.append(curr_log_prob)
+                    finish_reasons.append(output.outputs[0].finish_reason)
+                    stop_reasons.append(output.outputs[0].stop_reason)
                     curr_idx += 1
                 else:
                     response.append([0])
                     rollout_log_probs.append([0.])
+                    finish_reasons.append(None)
+                    stop_reasons.append(None)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
             rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
@@ -474,6 +483,32 @@ class vLLMRollout(BaseRollout):
                     non_tensor_batch["tools_kwargs"] = _repeat_interleave(non_tensor_batch["tools_kwargs"], self.sampling_params.n)
 
             seq = torch.cat([idx, response], dim=-1)
+
+        if self.config.get("capture_generation_diagnostics", False):
+            diagnostic_values = {
+                "resolved_sampling_params": resolved_sampling_params,
+                "rollout_model_path": self.model_path,
+                "active_lora_ids": list(lora_int_ids),
+                "lora_sync_fingerprint": getattr(
+                    self.inference_engine,
+                    "_lamer_lora_sync_diagnostics",
+                    None,
+                ),
+                "generation_do_sample": do_sample,
+                "generation_validate": is_validate,
+                "generation_engine_seed": self.config.get("seed", 0),
+            }
+            for key, value in diagnostic_values.items():
+                values = np.empty(batch_size, dtype=object)
+                for index in range(batch_size):
+                    values[index] = deepcopy(value)
+                non_tensor_batch[key] = values
+            non_tensor_batch["generation_finish_reason"] = np.asarray(
+                finish_reasons, dtype=object
+            )
+            non_tensor_batch["generation_stop_reason"] = np.asarray(
+                stop_reasons, dtype=object
+            )
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)

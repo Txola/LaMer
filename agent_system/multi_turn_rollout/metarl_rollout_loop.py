@@ -333,10 +333,23 @@ class TrajectoryCollector:
         episode_lengths = np.zeros(batch_size, dtype=np.int32)
 
         diagnostics_config = self.config.trainer.get('grouping_diagnostics', {})
+        training_diagnostics_config = self.config.trainer.get(
+            'training_interaction_diagnostics', {}
+        )
+        path_diagnostics_config = self.config.trainer.get(
+            'path_equivalence_diagnostics', {}
+        )
         capture_reflections = (
-            diagnostics_config.get('enabled', False)
-            and self.config.algorithm.adv_estimator == 'gigpo'
-            and self.config.env.env_name.lower() == 'minesweeper'
+            bool(self.config.trainer.get('validation_data_dir', None))
+            or (
+                self.config.env.env_name.lower() == 'minesweeper'
+                and (
+                    (diagnostics_config.get('enabled', False)
+                     and self.config.algorithm.adv_estimator == 'gigpo')
+                    or training_diagnostics_config.get('enabled', False)
+                    or path_diagnostics_config.get('enabled', False)
+                )
+            )
         )
 
         phase_and_steps = []
@@ -372,7 +385,12 @@ class TrajectoryCollector:
 
                 if capture_reflections:
                     previous_reflections = np.empty(batch_size, dtype=object)
-                    for i, reflections in enumerate(envs.get_previous_reflections(phase)):
+                    reflection_history = (
+                        envs.get_previous_reflections(phase)
+                        if hasattr(envs, 'get_previous_reflections')
+                        else [[] for _ in range(batch_size)]
+                    )
+                    for i, reflections in enumerate(reflection_history):
                         previous_reflections[i] = reflections
                     batch.non_tensor_batch['previous_reflections'] = previous_reflections
 
@@ -413,6 +431,8 @@ class TrajectoryCollector:
                         'parsed_action': [info.get('diagnostic_parsed_action') for info in infos],
                         'action_is_effective': [info.get('action_is_effective') for info in infos],
                         'next_anchor_obs': next_obs['anchor'] if phase == 'play' else [None] * batch_size,
+                        'task_type': [info.get('task_type') for info in infos],
+                        'gamefile': [info.get('extra.gamefile') for info in infos],
                     }.items():
                         metadata = np.empty(batch_size, dtype=object)
                         for i, value in enumerate(values):
@@ -450,11 +470,6 @@ class TrajectoryCollector:
 
                 for i in range(batch_size):
                     if active_masks[i]:
-                        if 'alfworld' in self.config.env.env_name.lower():
-                            try:
-                                batch_list[i].non_tensor_batch['extra.gamefiles'] = infos[i]['extra.gamefiles']
-                            except:
-                                pass
                         total_batch_list[i].append(batch_list[i])
                         total_infos[i].append(infos[i])
 
@@ -626,4 +641,3 @@ class TrajectoryCollector:
             total_episode_rewards.append(episode_rewards)
     
         return total_episode_rewards, total_discounted_returns
-     

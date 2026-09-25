@@ -53,8 +53,10 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.validation_diagnostics import (
+    attach_prompts_to_selected_trajectories,
     collect_validation_interactions,
     dump_validation_interactions,
+    dump_validation_trajectory_samples,
     summarize_validation_interactions,
 )
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -725,6 +727,9 @@ class RayPPOTrainer:
         data_source_lst = []
         success_rate_dict = {}
         validation_data_dir = self.config.trainer.get('validation_data_dir', None)
+        validation_dump_all_interactions = self.config.trainer.get(
+            'validation_dump_all_interactions', True
+        )
         validation_interactions = []
 
         # Lists to collect samples for the table
@@ -788,9 +793,29 @@ class RayPPOTrainer:
             del test_batch
             test_batch = test_output_gen_batch
             if validation_data_dir:
-                validation_interactions.extend(
-                    collect_validation_interactions(test_batch, self.tokenizer)
+                new_validation_interactions = collect_validation_interactions(
+                    test_batch,
+                    self.tokenizer,
+                    include_heavy_fields=validation_dump_all_interactions,
                 )
+                validation_interactions.extend(new_validation_interactions)
+                if not validation_dump_all_interactions:
+                    attach_prompts_to_selected_trajectories(
+                        all_records=validation_interactions,
+                        new_records=new_validation_interactions,
+                        data=test_batch,
+                        tokenizer=self.tokenizer,
+                        samples_per_task=int(
+                            self.config.trainer.get(
+                                'validation_trajectory_samples_per_task', 0
+                            )
+                        ),
+                        sample_seed=int(
+                            self.config.trainer.get(
+                                'validation_trajectory_sample_seed', 0
+                            )
+                        ),
+                    )
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
@@ -842,15 +867,33 @@ class RayPPOTrainer:
         if validation_data_dir:
             diagnostic_summary = summarize_validation_interactions(validation_interactions)
             metric_dict.update(diagnostic_summary['metrics'])
+            trajectory_samples_path = dump_validation_trajectory_samples(
+                records=validation_interactions,
+                dump_path=validation_data_dir,
+                global_step=self.global_steps,
+                samples_per_task=int(
+                    self.config.trainer.get('validation_trajectory_samples_per_task', 0)
+                ),
+                sample_seed=int(
+                    self.config.trainer.get('validation_trajectory_sample_seed', 0)
+                ),
+            )
+            if trajectory_samples_path:
+                diagnostic_summary['trajectory_samples_file'] = os.path.basename(
+                    trajectory_samples_path
+                )
             interactions_path, summary_path = dump_validation_interactions(
                 records=validation_interactions,
                 summary=diagnostic_summary,
                 dump_path=validation_data_dir,
                 global_step=self.global_steps,
+                validation_metrics=metric_dict,
+                dump_all_interactions=validation_dump_all_interactions,
             )
             print(
-                'Validation interaction diagnostics written to '
-                f'{interactions_path} and {summary_path}'
+                'Validation diagnostics written to '
+                f'{summary_path}'
+                + (f' and {interactions_path}' if interactions_path else '')
             )
 
         print(metric_dict)
@@ -1008,10 +1051,18 @@ class RayPPOTrainer:
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
         val_only = self.config.trainer.get("val_only", False)
-        # Evaluation needs policy weights only. Skipping Adam, scheduler, saved
-        # training RNG, and dataloader state saves RAM/I/O and keeps the
-        # checkpoint comparison on a common evaluation RNG stream.
-        if val_only and self.config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
+        training_diagnostics = self.config.trainer.get(
+            "training_interaction_diagnostics", {}
+        )
+        diagnostic_only = (
+            training_diagnostics.get("enabled", False)
+            and training_diagnostics.get("stop_after_dump", False)
+        )
+        policy_only = val_only or diagnostic_only
+        # Evaluation and one-shot rollout diagnostics need policy weights only.
+        # Skipping Adam, scheduler, saved training RNG, and dataloader state saves
+        # RAM/I/O and leaves generation controlled by the launcher seeds.
+        if policy_only and self.config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
             self.actor_rollout_wg.load_checkpoint(
                 actor_path,
                 del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
@@ -1023,12 +1074,12 @@ class RayPPOTrainer:
                 del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
         # load critic
-        if self.use_critic and not val_only:
+        if self.use_critic and not policy_only:
             self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
         # load dataloader,
         # TODO: from remote not implemented yet
-        if not val_only:
+        if not policy_only:
             dataloader_local_path = os.path.join(global_step_folder, "data.pt")
             if os.path.exists(dataloader_local_path):
                 dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
@@ -1150,6 +1201,33 @@ class RayPPOTrainer:
                     # batch = batch.union(gen_batch_output)
                     del batch
                     batch = gen_batch_output
+
+                    training_diagnostics = self.config.trainer.get(
+                        "training_interaction_diagnostics", {}
+                    )
+                    if training_diagnostics.get("enabled", False):
+                        interaction_records = collect_validation_interactions(
+                            batch, self.tokenizer
+                        )
+                        interaction_summary = summarize_validation_interactions(
+                            interaction_records
+                        )
+                        interactions_path, summary_path = dump_validation_interactions(
+                            records=interaction_records,
+                            summary=interaction_summary,
+                            dump_path=training_diagnostics["output_dir"],
+                            global_step=self.global_steps,
+                        )
+                        print(
+                            "Training-path interaction diagnostics written before "
+                            f"batch adjustment or optimization: {interactions_path} "
+                            f"and {summary_path}",
+                            flush=True,
+                        )
+                        if training_diagnostics.get("stop_after_dump", False):
+                            progress_bar.close()
+                            return
+
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
                             batch=batch,

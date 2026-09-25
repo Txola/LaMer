@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import inspect
 import logging
 import os
@@ -61,7 +62,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         device_mesh: DeviceMesh = None,
         offload_param: bool = False,
         load_format: str = 'dummy_hf',
-        layered_summon: bool = True
+        layered_summon: bool = True,
+        capture_generation_diagnostics: bool = False,
     ):
         self.module = module
         # For AsyncLLM, inference_engine and model_runner are defer intialized in vLLMAsyncRollout.load_model
@@ -80,6 +82,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.offload_param = offload_param
         self.load_format = load_format
         self.layered_summon = layered_summon
+        self.capture_generation_diagnostics = capture_generation_diagnostics
 
         # Full params
         self.full_params = full_params
@@ -296,6 +299,29 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         model = self.model_runner.model
         if peft_config:
             if self.base_sync_done:
+                if self.capture_generation_diagnostics:
+                    fingerprint = hashlib.sha256()
+                    parameter_count = 0
+                    element_count = 0
+                    for name, parameter in updated_params.items():
+                        tensor = (
+                            parameter.full_tensor()
+                            if isinstance(parameter, DTensor)
+                            else parameter
+                        )
+                        tensor = tensor.detach().cpu().contiguous()
+                        fingerprint.update(name.encode("utf-8"))
+                        fingerprint.update(str(tuple(tensor.shape)).encode("ascii"))
+                        fingerprint.update(str(tensor.dtype).encode("ascii"))
+                        fingerprint.update(tensor.view(torch.uint8).numpy().tobytes())
+                        parameter_count += 1
+                        element_count += tensor.numel()
+                    fingerprint.update(repr(asdict(peft_config)).encode("utf-8"))
+                    self.inference_engine._lamer_lora_sync_diagnostics = {
+                        "sha256": fingerprint.hexdigest(),
+                        "parameter_count": parameter_count,
+                        "element_count": element_count,
+                    }
                 lora_int_id=int(time.time_ns() % 0x7FFFFFFF)
                 lora_reqest = TensorLoRARequest(
                     lora_name=f"{lora_int_id}",

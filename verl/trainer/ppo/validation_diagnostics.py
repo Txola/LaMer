@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections import Counter, defaultdict
@@ -36,7 +37,9 @@ def _metadata_at(data, key: str, index: int, default=None):
     return _json_value(values[index])
 
 
-def collect_validation_interactions(data, tokenizer) -> list[dict[str, Any]]:
+def collect_validation_interactions(
+    data, tokenizer, include_heavy_fields: bool = True
+) -> list[dict[str, Any]]:
     """Convert a validation DataProto into human-readable interaction records."""
     responses = data.batch["responses"]
     prompts = data.batch["prompts"]
@@ -49,8 +52,9 @@ def collect_validation_interactions(data, tokenizer) -> list[dict[str, Any]]:
         prompt_mask = attention_mask[index, :-response_width].bool()
         response_ids = responses[index][response_mask]
         prompt_ids = prompts[index][prompt_mask]
-        response = tokenizer.decode(response_ids, skip_special_tokens=True)
-        prompt = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+        response = tokenizer.decode(
+            response_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
         phase = str(_metadata_at(data, "phase", index, "unknown"))
         attempt_zero_based = int(_metadata_at(data, "traj_idx", index, -1))
         turn_zero_based = int(_metadata_at(data, "turn_idx", index, -1))
@@ -59,7 +63,7 @@ def collect_validation_interactions(data, tokenizer) -> list[dict[str, Any]]:
         anchor_obs = _metadata_at(data, "anchor_obs", index)
         next_anchor_obs = _metadata_at(data, "next_anchor_obs", index)
         environment_effective_flag = _metadata_at(data, "action_is_effective", index)
-        board_changed = (
+        observation_changed = (
             anchor_obs != next_anchor_obs
             if phase == "play" and anchor_obs is not None and next_anchor_obs is not None
             else None
@@ -68,16 +72,20 @@ def collect_validation_interactions(data, tokenizer) -> list[dict[str, Any]]:
         record = {
             "uid": str(_metadata_at(data, "uid", index, "")),
             "traj_uid": str(_metadata_at(data, "traj_uid", index, "")),
+            "task_type": _metadata_at(data, "task_type", index),
+            "gamefile": _metadata_at(data, "gamefile", index),
             "phase": phase,
             "attempt": attempt_zero_based + 1,
             "attempt_zero_based": attempt_zero_based,
             "turn": turn_zero_based + 1,
             "turn_zero_based": turn_zero_based,
             "is_parse_valid": bool(_metadata_at(data, "is_action_valid", index, False)),
-            # board_changed is the reliable pre/post observation comparison.
+            # The pre/post observation comparison is the environment-agnostic
+            # effectiveness signal. Keep board_changed as a compatibility alias.
             # The environment flag can be stale when MineField returns early.
-            "is_effective": board_changed,
-            "board_changed": board_changed,
+            "is_effective": observation_changed,
+            "observation_changed": observation_changed,
+            "board_changed": observation_changed,
             "environment_action_is_effective": environment_effective_flag,
             "done": bool(_metadata_at(data, "action_done", index, False)),
             "won": bool(_metadata_at(data, "action_won", index, False)),
@@ -86,17 +94,61 @@ def collect_validation_interactions(data, tokenizer) -> list[dict[str, Any]]:
             "response_tokens": response_tokens,
             "response_token_limit": int(response_width),
             "response_reached_token_limit": response_tokens >= response_width,
+            "has_action_open_tag": "<action>" in response,
             "has_complete_action_tag": "<action>" in response and "</action>" in response,
             "has_complete_reflection_tag": "<remark>" in response and "</remark>" in response,
             "parsed_action": _metadata_at(data, "parsed_action", index),
             "anchor_obs": anchor_obs,
             "next_anchor_obs": next_anchor_obs,
             "previous_reflections": _metadata_at(data, "previous_reflections", index, []),
-            "prompt": prompt,
+            "resolved_sampling_params": _metadata_at(
+                data, "resolved_sampling_params", index
+            ),
+            "rollout_model_path": _metadata_at(data, "rollout_model_path", index),
+            "active_lora_ids": _metadata_at(data, "active_lora_ids", index, []),
+            "lora_sync_fingerprint": _metadata_at(
+                data, "lora_sync_fingerprint", index
+            ),
+            "generation_do_sample": _metadata_at(
+                data, "generation_do_sample", index
+            ),
+            "generation_validate": _metadata_at(
+                data, "generation_validate", index
+            ),
+            "generation_engine_seed": _metadata_at(
+                data, "generation_engine_seed", index
+            ),
+            "generation_finish_reason": _metadata_at(
+                data, "generation_finish_reason", index
+            ),
+            "generation_stop_reason": _metadata_at(
+                data, "generation_stop_reason", index
+            ),
             "response": response,
         }
+        if include_heavy_fields:
+            record.update({
+                "prompt_token_ids": prompt_ids.tolist(),
+                "generated_token_ids": response_ids.tolist(),
+                "model_facing_prompt": tokenizer.decode(
+                    prompt_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ),
+                "raw_decoded_response": tokenizer.decode(
+                    response_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ),
+                "prompt": tokenizer.decode(
+                    prompt_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                ),
+            })
         if record["is_effective"] is not None:
             record["is_effective"] = bool(record["is_effective"])
+            record["observation_changed"] = bool(record["observation_changed"])
             record["board_changed"] = bool(record["board_changed"])
         if record["environment_action_is_effective"] is not None:
             record["environment_action_is_effective"] = bool(
@@ -189,6 +241,8 @@ def summarize_validation_interactions(records: list[dict[str, Any]]) -> dict[str
         known = [row for row in task_records if row["is_effective"] is not None]
         task_summaries.append({
             "uid": uid,
+            "task_type": task_records[0].get("task_type"),
+            "gamefile": task_records[0].get("gamefile"),
             "play_records": len(task_records),
             "parse_rate": _rate(task_records, lambda row: row["is_parse_valid"]),
             "effective_rate": _rate(known, lambda row: row["is_effective"]),
@@ -221,25 +275,181 @@ def summarize_validation_interactions(records: list[dict[str, Any]]) -> dict[str
 
 
 def dump_validation_interactions(
-    records: list[dict[str, Any]], summary: dict[str, Any], dump_path: str, global_step: int
-) -> tuple[str, str]:
-    """Write every interaction and its aggregate summary before validation returns."""
+    records: list[dict[str, Any]],
+    summary: dict[str, Any],
+    dump_path: str,
+    global_step: int,
+    validation_metrics: dict[str, Any] | None = None,
+    dump_all_interactions: bool = True,
+) -> tuple[str | None, str]:
+    """Write validation metrics/summary and, when requested, every interaction."""
     os.makedirs(dump_path, exist_ok=True)
     stem = f"step_{global_step:06d}"
     interactions_path = os.path.join(dump_path, f"{stem}_interactions.jsonl")
     summary_path = os.path.join(dump_path, f"{stem}_summary.json")
+    metrics_path = os.path.join(dump_path, f"{stem}_metrics.json")
 
-    with open(interactions_path, "w", encoding="utf-8") as stream:
-        for record in records:
-            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    interaction_file = None
+    if dump_all_interactions:
+        interaction_file = os.path.basename(interactions_path)
+        with open(interactions_path, "w", encoding="utf-8") as stream:
+            for record in records:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    metrics_file = None
+    if validation_metrics is not None:
+        metrics_file = os.path.basename(metrics_path)
+        with open(metrics_path, "w", encoding="utf-8") as stream:
+            json.dump(_json_value(validation_metrics), stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
 
     payload = {
         "global_step": global_step,
-        "interaction_file": os.path.basename(interactions_path),
+        "interaction_file": interaction_file,
+        "metrics_file": metrics_file,
+        "validation_metrics": _json_value(validation_metrics or {}),
         **summary,
     }
     with open(summary_path, "w", encoding="utf-8") as stream:
         json.dump(payload, stream, ensure_ascii=False, indent=2)
         stream.write("\n")
 
-    return interactions_path, summary_path
+    return interactions_path if dump_all_interactions else None, summary_path
+
+
+def _markdown_block(value: Any) -> str:
+    text = str(value if value is not None else "")
+    return "\n".join(f"    {line}" for line in text.splitlines()) or "    "
+
+
+def _trajectory_key(record: dict[str, Any]) -> tuple[str, str]:
+    identity = str(record.get("gamefile") or record.get("uid") or record.get("traj_uid"))
+    task_type = str(record.get("task_type") or "unknown")
+    return task_type, identity
+
+
+def select_validation_trajectory_keys(
+    records: list[dict[str, Any]], samples_per_task: int, sample_seed: int
+) -> set[tuple[str, str]]:
+    """Select stable trajectory identities without relying on Python's hash seed."""
+    by_task: dict[str, set[str]] = defaultdict(set)
+    for record in records:
+        task_type, identity = _trajectory_key(record)
+        by_task[task_type].add(identity)
+
+    selected: set[tuple[str, str]] = set()
+    for task_type in sorted(by_task):
+        identities = sorted(
+            by_task[task_type],
+            key=lambda identity: hashlib.sha256(
+                f"{sample_seed}:{identity}".encode("utf-8")
+            ).hexdigest(),
+        )
+        selected.update(
+            (task_type, identity) for identity in identities[:samples_per_task]
+        )
+    return selected
+
+
+def attach_prompts_to_selected_trajectories(
+    all_records: list[dict[str, Any]],
+    new_records: list[dict[str, Any]],
+    data,
+    tokenizer,
+    samples_per_task: int,
+    sample_seed: int,
+) -> None:
+    """Decode prompts only for the currently selected trajectory samples."""
+    selected = select_validation_trajectory_keys(
+        all_records, samples_per_task, sample_seed
+    )
+    for record in all_records:
+        if _trajectory_key(record) not in selected:
+            record.pop("prompt", None)
+
+    responses = data.batch["responses"]
+    prompts = data.batch["prompts"]
+    attention_mask = data.batch["attention_mask"]
+    response_width = responses.shape[-1]
+    for index, record in enumerate(new_records):
+        if _trajectory_key(record) not in selected:
+            continue
+        prompt_mask = attention_mask[index, :-response_width].bool()
+        prompt_ids = prompts[index][prompt_mask]
+        record["prompt"] = tokenizer.decode(
+            prompt_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+
+def dump_validation_trajectory_samples(
+    records: list[dict[str, Any]],
+    dump_path: str,
+    global_step: int,
+    samples_per_task: int,
+    sample_seed: int = 0,
+) -> str | None:
+    """Write deterministic, task-balanced, human-readable trajectory samples."""
+    if samples_per_task <= 0:
+        return None
+
+    selected_keys = select_validation_trajectory_keys(
+        records, samples_per_task, sample_seed
+    )
+    by_trajectory: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        key = _trajectory_key(record)
+        if key in selected_keys:
+            by_trajectory[key].append(record)
+
+    selected: list[tuple[str, str, list[dict[str, Any]]]] = []
+    for task_type, identity in sorted(selected_keys):
+        selected.append((task_type, identity, by_trajectory[(task_type, identity)]))
+
+    os.makedirs(dump_path, exist_ok=True)
+    output_path = os.path.join(
+        dump_path, f"step_{global_step:06d}_trajectory_samples.md"
+    )
+    with open(output_path, "w", encoding="utf-8") as stream:
+        stream.write("# Validation trajectory samples\n\n")
+        stream.write(
+            f"Selected deterministically by task type with seed {sample_seed}; "
+            "this file contains only the sampled trajectories.\n\n"
+        )
+        for task_type, identity, trajectory_records in selected:
+            won = any(record.get("won", False) for record in trajectory_records)
+            stream.write(f"## {task_type}\n\n")
+            stream.write(f"- Game: `{identity}`\n")
+            stream.write(f"- Success within allowed attempts: `{won}`\n\n")
+            first_play = next(
+                (record for record in trajectory_records if record.get("phase") == "play"),
+                None,
+            )
+            if first_play is not None:
+                stream.write("### Initial observation\n\n")
+                stream.write(_markdown_block(first_play.get("anchor_obs")) + "\n\n")
+
+            for record in trajectory_records:
+                phase = record.get("phase", "unknown")
+                attempt = record.get("attempt", "?")
+                turn = record.get("turn", "?")
+                stream.write(f"### Attempt {attempt}, {phase}, turn {turn}\n\n")
+                stream.write("Prompt sent to the model:\n\n")
+                stream.write(_markdown_block(record.get("prompt", "unavailable")) + "\n\n")
+                stream.write("Model response:\n\n")
+                stream.write(_markdown_block(record.get("response")) + "\n\n")
+                stream.write("Parsed action/reflection:\n\n")
+                stream.write(_markdown_block(record.get("parsed_action")) + "\n\n")
+                if phase == "play":
+                    stream.write("Resulting observation:\n\n")
+                    stream.write(_markdown_block(record.get("next_anchor_obs")) + "\n\n")
+                stream.write(
+                    "Outcome: "
+                    f"parse_valid={record.get('is_parse_valid')}, "
+                    f"observation_changed={record.get('observation_changed')}, "
+                    f"done={record.get('done')}, won={record.get('won')}, "
+                    f"reward={record.get('immediate_reward')}\n\n"
+                )
+
+    return output_path
