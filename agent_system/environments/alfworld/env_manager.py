@@ -330,8 +330,9 @@ def make_envs(config):
             'num_gpus_per_worker': worker_resources.get('num_gpus', 0),
             'games_per_worker': config.env.alfworld.get('games_per_worker', 32),
         }
+        validation_seed = config.env.get('val_seed', config.env.seed + 1000)
         _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs)
-        _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs)
+        _val_envs = build_alfworld_envs(alf_config_path, validation_seed, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs)
         
         num_attempts = config.env.get('num_attempts', 1)
         do_reflection = config.env.get('do_reflection', True)

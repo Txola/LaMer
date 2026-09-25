@@ -1,6 +1,7 @@
 dataset:
   data_path: '$ALFWORLD_DATA/json/train_first4'
   eval_id_data_path: '$ALFWORLD_DATA/json/valid_first4' # valid_train + valid_seen
+  eval_id_checkpoint_data_path: '$ALFWORLD_DATA/json/valid_id_task_balanced84' # 21 per ID task
   eval_ood_data_path: '$ALFWORLD_DATA/json/valid_last2' # valid_train + valid_seen
   eval_all_data_path: '$ALFWORLD_DATA/json/valid_task_balanced126' # 21 per task
   eval_full_data_path: '$ALFWORLD_DATA/json/valid_all' # all 340 held-out games

@@ -7,10 +7,12 @@ ALFWorld's ``valid_train`` and ``valid_seen`` splits. Both contain held-out task
 instances in training-distribution rooms, so task category remains the intended
 distribution shift rather than room-scene novelty.
 
-In addition to the complete validation pools, the script creates a fixed,
-task-balanced 126-game checkpoint split containing 21 games from each of the
-six task types. The generated tree contains real directories and symlinks to
-the original trial files. The source download is never changed or duplicated.
+In addition to the complete validation pools, the script creates fixed,
+task-balanced checkpoint splits containing the same sampled games used by the
+all-task evaluation: one for the four in-distribution task types and one for
+all six task types. The generated tree contains real directories and symlinks
+to the original trial files. The source download is never changed or
+duplicated.
 """
 
 from __future__ import annotations
@@ -219,6 +221,12 @@ def main() -> None:
     checkpoint_size = args.checkpoint_games_per_task * len(ALL_TASK_TYPES)
     checkpoint_split = f"valid_task_balanced{checkpoint_size}"
     selected[checkpoint_split] = checkpoint_trials
+    id_checkpoint_trials = [
+        trial for trial in checkpoint_trials if trial.task_type in ID_TASK_TYPES
+    ]
+    id_checkpoint_size = args.checkpoint_games_per_task * len(ID_TASK_TYPES)
+    id_checkpoint_split = f"valid_id_task_balanced{id_checkpoint_size}"
+    selected[id_checkpoint_split] = id_checkpoint_trials
 
     for name, trials in selected.items():
         print(f"{name}: {len(trials)} trials {task_counts(trials)}")
@@ -245,8 +253,10 @@ def main() -> None:
             "ood_task_types": list(OOD_TASK_TYPES),
             "checkpoint_evaluation": {
                 "split": checkpoint_split,
+                "id_split": id_checkpoint_split,
                 "seed": args.sample_seed,
                 "total_count": checkpoint_size,
+                "id_count": id_checkpoint_size,
                 "games_per_task": args.checkpoint_games_per_task,
                 "task_counts": task_counts(checkpoint_trials),
                 "games": [

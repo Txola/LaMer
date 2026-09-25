@@ -139,6 +139,8 @@ class AlfredTWEnv(object):
             data_path = os.path.expandvars(self.config['dataset']['data_path'])
         elif self.train_eval == "eval_in_distribution":
             data_path = os.path.expandvars(self.config['dataset']['eval_id_data_path'])
+        elif self.train_eval == "eval_id_checkpoint":
+            data_path = os.path.expandvars(self.config['dataset']['eval_id_checkpoint_data_path'])
         elif self.train_eval == "eval_out_of_distribution":
             data_path = os.path.expandvars(self.config['dataset']['eval_ood_data_path'])
         elif self.train_eval == 'eval_all':
