@@ -1,6 +1,7 @@
 import os
 import json
 import random
+from functools import partial
 
 from tqdm import tqdm
 from termcolor import colored
@@ -255,8 +256,11 @@ class AlfredTWEnv(object):
         if self.train_eval != "train":
             domain_randomization = False
 
-        alfred_demangler = AlfredDemangler(shuffle=domain_randomization)
-        wrappers = [alfred_demangler, AlfredInfos]
+        # TextWorld calls each entry as a wrapper factory. Passing a wrapper
+        # instance is only safe with one subprocess per environment; a
+        # synchronous batch would otherwise reuse one mutable wrapper (and one
+        # underlying game state) for every batch slot.
+        wrappers = [partial(AlfredDemangler, shuffle=domain_randomization), AlfredInfos]
 
         # Register a new Gym environment.
         request_infos = textworld.EnvInfos(won=True, admissible_commands=True, extras=["gamefile"])
@@ -272,15 +276,16 @@ class AlfredTWEnv(object):
             else:
                 expert_plan = False
             if expert_plan:
-                wrappers.append(AlfredExpert(expert_type))
+                wrappers.append(partial(AlfredExpert, expert_type=expert_type))
                 request_infos.extras.append("expert_plan")
 
         else:
             raise NotImplementedError
 
+        asynchronous = self.config["env"].get("textworld_asynchronous", True)
         env_id = textworld.gym.register_games(self.game_files, request_infos,
                                               batch_size=batch_size,
-                                              asynchronous=True,
+                                              asynchronous=asynchronous,
                                               max_episode_steps=max_nb_steps_per_episode,
                                               wrappers=wrappers)
         # Launch Gym environment.

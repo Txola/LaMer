@@ -97,7 +97,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         infos = [{
                 "action_is_valid": True,
                 "won": False,
-                'task_type': self.task_types[i]
+                'task_type': self.task_types[i],
+                'extra.gamefile': self.gamefile[i],
             } for i in range(self.num_processes)]
         
         observations = {
@@ -113,6 +114,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         text_obs, image_obs, infos = self.envs.restart()
         self.curr_traj_idx += 1
         self.curr_turn_idx = 0
+        self.pre_text_obs = text_obs
         full_text_obs = self.build_text_obs(self.envs.get_admissible_commands, phase='play')
         for info, task_type in zip(infos, self.task_types):
             info['task_type'] = task_type
@@ -128,6 +130,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             for i, info in enumerate(infos):
                 info['is_action_valid'] = to_numpy(valids[i])
                 info['task_type'] = self.task_types[i]
+                info['diagnostic_parsed_action'] = actions[i]
+                info['action_is_effective'] = text_obs[i] != self.pre_text_obs[i]
                 
             self.memories[self.curr_traj_idx].store({
                                                     'text_obs': text_obs, 
@@ -140,6 +144,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             full_text_obs = self.build_text_obs(self.envs.get_admissible_commands, phase=phase)
             if infos[0].get("extra.gamefile") is None:
                 infos = set_gamefile(infos, self.gamefile)
+            self.pre_text_obs = text_obs
 
             next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
             rewards = to_numpy(rewards)
@@ -155,12 +160,15 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # next_obs, rewards, dones, infos = self.envs.step(actions)
             infos = [{
                 "action_is_valid": False,
-                "won": False
-            } for _ in range(self.num_processes)]
+                "won": False,
+                "extra.gamefile": self.gamefile[i],
+            } for i in range(self.num_processes)]
 
             for i, info in enumerate(infos):
                 info['is_action_valid'] = to_numpy(valids[i])
                 info['task_type'] = self.task_types[i]
+                info['diagnostic_parsed_action'] = reflections[i]
+                info['action_is_effective'] = bool(reflections[i])
                 
             next_observations = {
                     'text': '',  
@@ -170,6 +178,16 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             rewards = np.array(valids)
             dones = np.array([False] * len(text_actions))
             return next_observations, rewards, dones, infos
+
+    def get_previous_reflections(self, phase: str = 'play') -> List[List[str]]:
+        """Return the reflection texts that are present in the current prompt."""
+        if (phase != 'play' or self.curr_traj_idx == 0
+                or self.reflection_type == 'history_only'):
+            return [[] for _ in range(self.num_processes)]
+        return [
+            [reflection[idx] for idx in range(self.curr_traj_idx)] if reflection else []
+            for reflection in self.reflections
+        ]
 
     
     def extract_task(self, text_obs: List[str]):
@@ -304,9 +322,13 @@ def make_envs(config):
         else:
             raise ValueError(f"Unsupported environment: {config.env.env_name}")
 
+        worker_resources = config.env.get('resources_per_worker', {})
         env_kwargs = {
             # eval_all is the fixed checkpoint subset; eval_full is all held-out games.
             'eval_dataset': config.env.alfworld.get('eval_dataset', 'eval_all'),
+            'num_cpus_per_worker': worker_resources.get('num_cpus', 0.1),
+            'num_gpus_per_worker': worker_resources.get('num_gpus', 0),
+            'games_per_worker': config.env.alfworld.get('games_per_worker', 32),
         }
         _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs)
         _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs)
