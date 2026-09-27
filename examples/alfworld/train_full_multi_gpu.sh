@@ -34,7 +34,7 @@ if [[ "$SMOKE_TEST" == 1 ]]; then
     DEFAULT_TEST_FREQ=1
     DEFAULT_VAL_TASK_COUNT=4
     DEFAULT_CAPTURE_GENERATION_DIAGNOSTICS=True
-    DEFAULT_GROUPING_DIAGNOSTICS=True
+    DEFAULT_GROUPING_DIAGNOSTICS=False
     DEFAULT_EXPERIMENT_NAME="alfworld_full_qwen3_4b_smoke_${RUN_ID}"
     DEFAULT_OUTPUT_DIR="$REPO_ROOT/outputs/alfworld_full_multi_gpu/smoke_${RUN_ID}"
 else
@@ -43,7 +43,7 @@ else
     DEFAULT_TEST_FREQ=5
     DEFAULT_VAL_TASK_COUNT=84
     DEFAULT_CAPTURE_GENERATION_DIAGNOSTICS=True
-    DEFAULT_GROUPING_DIAGNOSTICS=True
+    DEFAULT_GROUPING_DIAGNOSTICS=False
     DEFAULT_EXPERIMENT_NAME=alfworld_full_qwen3_4b_main
     DEFAULT_OUTPUT_DIR="$REPO_ROOT/outputs/alfworld_full_multi_gpu/alfworld_full_qwen3_4b_main"
     if [[ "$ALLOW_PRODUCTION" != 1 && "$DRY_RUN" != 1 ]]; then
@@ -108,13 +108,14 @@ case "$HARDWARE_PROFILE" in
     large_96gb)
         PROFILE_N_GPUS=1
         PROFILE_TENSOR_PARALLEL_SIZE=1
-        PROFILE_ACTOR_MICRO_BATCH_SIZE=16
+        PROFILE_ACTOR_MICRO_BATCH_SIZE=8
         PROFILE_LOG_PROB_MICRO_BATCH_SIZE=32
         PROFILE_ACTOR_PARAM_OFFLOAD=False
-        # Keep Adam on the 96 GB GPU to avoid a roughly 32 GiB PCIe transfer
-        # each update. The smaller vLLM budget leaves room during generation.
+        # Microbatch 16 exhausted VRAM during backward, while CPU-offloading
+        # Adam caused the 62 GiB host to kill the worker. Keep Adam on GPU,
+        # use microbatch 8, and leave rollout headroom with a 35% vLLM budget.
         PROFILE_ACTOR_OPTIMIZER_OFFLOAD=False
-        PROFILE_GPU_MEMORY_UTILIZATION=0.4
+        PROFILE_GPU_MEMORY_UTILIZATION=0.35
         PROFILE_MAX_NUM_BATCHED_TOKENS=32768
         PROFILE_VLLM_ATTENTION_BACKEND=FLASH_ATTN
         PROFILE_RAY_NUM_CPUS=18
