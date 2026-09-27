@@ -1,4 +1,4 @@
-"""Read-only Minesweeper grouping diagnostics, written before actor backward."""
+"""Read-only agent grouping diagnostics, written before actor backward."""
 
 import json
 import os
@@ -11,7 +11,7 @@ from verl.trainer.ppo.core_gigpo import to_hashable
 
 
 def _json_value(value):
-    """Collation can turn coordinate lists and numeric anchors into arrays."""
+    """Collation can turn parsed actions and numeric anchors into arrays."""
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):
@@ -131,11 +131,11 @@ def dump_gigpo_groups(batch, output_dir, step, cross_attempt_only=False):
         'play_records_file': records_path.name,
         'play_records_include_all_play_groups': True,
         'member_metadata_semantics': {
-            'parsed_action': 'Exact parser coordinates sent to the environment; left click is implicit.',
-            'is_action_valid': 'Parsing validity only; not board bounds or action effectiveness.',
-            'action_is_effective': 'Environment flag comparing board_disp to board_disp_prev; retained verbatim.',
+            'parsed_action': 'Exact parser output sent to the environment.',
+            'is_action_valid': 'Parsing validity only; not action effectiveness.',
+            'action_is_effective': 'Environment flag comparing visible state before and after the action; retained verbatim.',
             'immediate_reward': 'Raw environment reward before trainer penalties; not step_return.',
-            'next_anchor_obs': 'Visible board returned after this action.',
+            'next_anchor_obs': 'Visible environment state returned after this action.',
             'missing_optional_fields': 'null; unavailable, not false or zero.',
         },
         'global_step': int(step),

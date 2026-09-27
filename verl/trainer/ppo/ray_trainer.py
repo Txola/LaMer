@@ -1582,7 +1582,10 @@ class RayPPOTrainer:
                     diagnostics_config = self.config.trainer.get("grouping_diagnostics", {})
                     if (diagnostics_config.get("enabled", False)
                             and self.config.algorithm.adv_estimator == "gigpo"
-                            and self.config.env.env_name.lower() == "minesweeper"):
+                            and (
+                                self.config.env.env_name.lower() == "minesweeper"
+                                or "alfworld" in self.config.env.env_name.lower()
+                            )):
                         from verl.trainer.ppo.grouping_diagnostics import dump_gigpo_groups
 
                         diagnostics_path = dump_gigpo_groups(
