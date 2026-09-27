@@ -298,6 +298,11 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1
+  # interval: save using save_freq; best_and_last: save strict metric
+  # improvements at validation and always save the final training step.
+  checkpoint_policy: interval
+  checkpoint_metric: val/meta_rl/p_at_3
+  checkpoint_metric_mode: max
   # auto: find the last ckpt to resume. If can't find, start from scratch
   resume_mode: auto # or disable or resume_path if resume_from_path is set
   resume_from_path: null

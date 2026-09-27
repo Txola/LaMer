@@ -20,6 +20,8 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import re
+import shutil
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
@@ -1088,6 +1090,144 @@ class RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    def _load_checkpoint_policy_state(self):
+        self._best_checkpoint_value = None
+        self._best_checkpoint_step = None
+        if self.config.trainer.get("checkpoint_policy", "interval") != "best_and_last":
+            return
+
+        state_path = os.path.join(
+            self.config.trainer.default_local_dir, "checkpoint_policy.json"
+        )
+        if not os.path.exists(state_path):
+            latest_tracker = os.path.join(
+                self.config.trainer.default_local_dir,
+                "latest_checkpointed_iteration.txt",
+            )
+            if os.path.exists(latest_tracker):
+                raise RuntimeError(
+                    "A checkpoint exists without checkpoint_policy.json; "
+                    "refusing to resume because the best validation checkpoint "
+                    "cannot be reconstructed safely"
+                )
+            return
+
+        with open(state_path, encoding="utf-8") as stream:
+            state = json.load(stream)
+        metric_name = self.config.trainer.get(
+            "checkpoint_metric", "val/meta_rl/p_at_3"
+        )
+        metric_mode = self.config.trainer.get("checkpoint_metric_mode", "max")
+        if (
+            state.get("policy") != "best_and_last"
+            or state.get("metric") != metric_name
+            or state.get("mode") != metric_mode
+        ):
+            raise RuntimeError(
+                "Checkpoint policy state does not match the configured metric: "
+                f"saved={state.get('metric')}/{state.get('mode')} "
+                f"configured={metric_name}/{metric_mode}"
+            )
+        self._best_checkpoint_value = float(state["best_value"])
+        self._best_checkpoint_step = int(state["best_step"])
+        last_checkpoint_step = int(state["last_checkpoint_step"])
+        if last_checkpoint_step != self.global_steps:
+            raise RuntimeError(
+                "Checkpoint policy state is inconsistent with the checkpoint "
+                f"tracker: policy step={last_checkpoint_step}, "
+                f"loaded step={self.global_steps}"
+            )
+        best_checkpoint_path = os.path.join(
+            self.config.trainer.default_local_dir,
+            f"global_step_{self._best_checkpoint_step}",
+        )
+        if not os.path.isdir(best_checkpoint_path):
+            raise RuntimeError(
+                f"Best checkpoint directory is missing: {best_checkpoint_path}"
+            )
+        print(
+            f"Restored best checkpoint: step {self._best_checkpoint_step}, "
+            f"{metric_name}={self._best_checkpoint_value:.6f}"
+        )
+
+    def _checkpoint_metric_value(self, val_metrics):
+        metric_name = self.config.trainer.get(
+            "checkpoint_metric", "val/meta_rl/p_at_3"
+        )
+        if not val_metrics or metric_name not in val_metrics:
+            raise KeyError(
+                f"Checkpoint metric {metric_name!r} is absent from validation metrics"
+            )
+        value = float(val_metrics[metric_name])
+        if not np.isfinite(value):
+            raise ValueError(
+                f"Checkpoint metric {metric_name!r} must be finite; got {value}"
+            )
+        return value
+
+    def _is_better_checkpoint_value(self, value):
+        if self._best_checkpoint_value is None:
+            return True
+        mode = self.config.trainer.get("checkpoint_metric_mode", "max")
+        if mode == "max":
+            return value > self._best_checkpoint_value
+        if mode == "min":
+            return value < self._best_checkpoint_value
+        raise ValueError(f"checkpoint_metric_mode must be max or min; got {mode!r}")
+
+    def _write_checkpoint_policy_state(self, last_checkpoint_step):
+        if self._best_checkpoint_value is None or self._best_checkpoint_step is None:
+            raise RuntimeError(
+                "best_and_last checkpointing requires a validation metric before "
+                "saving"
+            )
+        checkpoint_dir = self.config.trainer.default_local_dir
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        metric_name = self.config.trainer.get(
+            "checkpoint_metric", "val/meta_rl/p_at_3"
+        )
+        metric_mode = self.config.trainer.get("checkpoint_metric_mode", "max")
+        state = {
+            "policy": "best_and_last",
+            "metric": metric_name,
+            "mode": metric_mode,
+            "best_value": self._best_checkpoint_value,
+            "best_step": self._best_checkpoint_step,
+            "last_checkpoint_step": int(last_checkpoint_step),
+        }
+        state_path = os.path.join(checkpoint_dir, "checkpoint_policy.json")
+        temporary_path = state_path + ".tmp"
+        with open(temporary_path, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.replace(temporary_path, state_path)
+
+        best_tracker = os.path.join(
+            checkpoint_dir, "best_checkpointed_iteration.txt"
+        )
+        temporary_tracker = best_tracker + ".tmp"
+        with open(temporary_tracker, "w", encoding="utf-8") as stream:
+            stream.write(str(self._best_checkpoint_step))
+        os.replace(temporary_tracker, best_tracker)
+
+    def _prune_best_and_last_checkpoints(self, last_checkpoint_step):
+        checkpoint_dir = self.config.trainer.default_local_dir
+        keep_steps = {int(last_checkpoint_step)}
+        if self._best_checkpoint_step is not None:
+            keep_steps.add(int(self._best_checkpoint_step))
+
+        for entry in os.scandir(checkpoint_dir):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            match = re.fullmatch(r"global_step_(\d+)", entry.name)
+            if match is None or int(match.group(1)) in keep_steps:
+                continue
+            print(
+                f"Removing checkpoint {entry.path}; retaining steps "
+                f"{sorted(keep_steps)}"
+            )
+            shutil.rmtree(entry.path)
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
@@ -1196,6 +1336,7 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self._load_checkpoint_policy_state()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -1218,6 +1359,7 @@ class RayPPOTrainer:
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                val_metrics = None
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
@@ -1487,14 +1629,65 @@ class RayPPOTrainer:
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
                         with _timer("testing", timing_raw):
-                            val_metrics: dict = self._validate()
+                            val_metrics = self._validate()
                             if is_last_step:
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
 
-                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                        with _timer("save_checkpoint", timing_raw):
-                            self._save_checkpoint()
+                    checkpoint_policy = self.config.trainer.get(
+                        "checkpoint_policy", "interval"
+                    )
+                    if checkpoint_policy == "best_and_last":
+                        candidate_value = None
+                        new_best = False
+                        if val_metrics is not None:
+                            candidate_value = self._checkpoint_metric_value(val_metrics)
+                            new_best = self._is_better_checkpoint_value(candidate_value)
+                            metrics["checkpoint/candidate_value"] = candidate_value
+                            metrics["checkpoint/new_best"] = float(new_best)
+
+                        should_save = new_best or is_last_step
+                        metrics["checkpoint/saved"] = float(should_save)
+                        if should_save:
+                            previous_best_value = self._best_checkpoint_value
+                            previous_best_step = self._best_checkpoint_step
+                            if new_best:
+                                self._best_checkpoint_value = candidate_value
+                                self._best_checkpoint_step = self.global_steps
+                            try:
+                                with _timer("save_checkpoint", timing_raw):
+                                    reason = "best and final" if new_best and is_last_step else "best" if new_best else "final"
+                                    print(
+                                        f"Saving {reason} checkpoint at step "
+                                        f"{self.global_steps}"
+                                    )
+                                    self._save_checkpoint()
+                                    self._write_checkpoint_policy_state(
+                                        last_checkpoint_step=self.global_steps
+                                    )
+                                    self._prune_best_and_last_checkpoints(
+                                        last_checkpoint_step=self.global_steps
+                                    )
+                            except Exception:
+                                self._best_checkpoint_value = previous_best_value
+                                self._best_checkpoint_step = previous_best_step
+                                raise
+
+                        if self._best_checkpoint_value is not None:
+                            metrics["checkpoint/best_value"] = self._best_checkpoint_value
+                            metrics["checkpoint/best_step"] = self._best_checkpoint_step
+                    elif checkpoint_policy == "interval":
+                        if self.config.trainer.save_freq > 0 and (
+                            is_last_step
+                            or self.global_steps % self.config.trainer.save_freq == 0
+                        ):
+                            with _timer("save_checkpoint", timing_raw):
+                                self._save_checkpoint()
+                    else:
+                        raise ValueError(
+                            "checkpoint_policy must be interval or best_and_last; "
+                            f"got {checkpoint_policy!r}"
+                        )
 
                 # training metrics
                 metrics.update(
