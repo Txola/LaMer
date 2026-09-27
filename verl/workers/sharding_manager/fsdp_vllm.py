@@ -83,6 +83,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.load_format = load_format
         self.layered_summon = layered_summon
         self.capture_generation_diagnostics = capture_generation_diagnostics
+        self.weight_sync_count = 0
 
         # Full params
         self.full_params = full_params
@@ -331,6 +332,16 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     lora_tensors=updated_params,
                 )
                 self.inference_engine.llm_engine.add_lora(lora_reqest)
+                self.weight_sync_count += 1
+                self.inference_engine._lamer_weight_sync_diagnostics = {
+                    "sync_count": self.weight_sync_count,
+                    "parameter_count": len(updated_params),
+                    "element_count": sum(
+                        parameter.numel() for parameter in updated_params.values()
+                    ),
+                    "is_lora": True,
+                    "loaded_parameter_count": len(updated_params),
+                }
                 logger.info(f"vLLM load weights, loaded_params: {len(updated_params)}")
                 return
             else:
@@ -348,4 +359,15 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         loaded_params = model.load_weights(((name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param) for name, param in updated_params.items()))
 
         self.base_sync_done = True
-        logger.info(f"vLLM load weights, loaded_params: {len(loaded_params) if loaded_params else -1}")
+        loaded_parameter_count = len(loaded_params) if loaded_params else -1
+        self.weight_sync_count += 1
+        self.inference_engine._lamer_weight_sync_diagnostics = {
+            "sync_count": self.weight_sync_count,
+            "parameter_count": len(updated_params),
+            "element_count": sum(
+                parameter.numel() for parameter in updated_params.values()
+            ),
+            "is_lora": peft_config is not None,
+            "loaded_parameter_count": loaded_parameter_count,
+        }
+        logger.info(f"vLLM load weights, loaded_params: {loaded_parameter_count}")

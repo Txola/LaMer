@@ -152,10 +152,19 @@ def get_model_size(model: nn.Module, scale="auto"):
 
 
 def print_model_size(model: nn.Module, name: str = None):
+    total_params = sum(parameter.numel() for parameter in model.parameters())
+    trainable_params = sum(
+        parameter.numel() for parameter in model.parameters()
+        if parameter.requires_grad
+    )
     n_params, scale = get_model_size(model, scale="auto")
     if name is None:
         name = model.__class__.__name__
-    print(f"{name} contains {n_params:.2f}{scale} parameters")
+    print(
+        f"{name} contains {n_params:.2f}{scale} parameters; "
+        f"trainable={trainable_params} total={total_params} "
+        f"fraction={trainable_params / total_params:.6f}"
+    )
 
 
 def create_random_mask(

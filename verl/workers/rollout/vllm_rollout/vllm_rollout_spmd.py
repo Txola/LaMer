@@ -131,7 +131,7 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
-        self.inference_engine = LLM(
+        llm_kwargs = dict(
             model=model_path,
             enable_sleep_mode=True,
             tensor_parallel_size=tensor_parallel_size,
@@ -141,7 +141,6 @@ class vLLMRollout(BaseRollout):
             gpu_memory_utilization=config.gpu_memory_utilization,
             disable_custom_all_reduce=True,
             disable_mm_preprocessor_cache=True,
-            limit_mm_per_prompt=limit_mm_per_prompt,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
             load_format=load_format,
@@ -151,9 +150,14 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
-            **lora_kwargs,
-            **engine_kwargs,
         )
+        # vLLM 0.10+ validates this as a dictionary, while older versions
+        # accepted None. Omitting it preserves each version's text-only default.
+        if limit_mm_per_prompt is not None:
+            llm_kwargs["limit_mm_per_prompt"] = limit_mm_per_prompt
+        llm_kwargs.update(lora_kwargs)
+        llm_kwargs.update(engine_kwargs)
+        self.inference_engine = LLM(**llm_kwargs)
 
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
@@ -492,6 +496,11 @@ class vLLMRollout(BaseRollout):
                 "lora_sync_fingerprint": getattr(
                     self.inference_engine,
                     "_lamer_lora_sync_diagnostics",
+                    None,
+                ),
+                "weight_sync": getattr(
+                    self.inference_engine,
+                    "_lamer_weight_sync_diagnostics",
                     None,
                 ),
                 "generation_do_sample": do_sample,

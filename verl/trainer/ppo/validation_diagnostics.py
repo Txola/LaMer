@@ -109,6 +109,7 @@ def collect_validation_interactions(
             "lora_sync_fingerprint": _metadata_at(
                 data, "lora_sync_fingerprint", index
             ),
+            "weight_sync": _metadata_at(data, "weight_sync", index),
             "generation_do_sample": _metadata_at(
                 data, "generation_do_sample", index
             ),
@@ -182,6 +183,11 @@ def summarize_validation_interactions(records: list[dict[str, Any]]) -> dict[str
         for record in effective_known
         if record.get("environment_action_is_effective") is not None
     ]
+    weight_syncs = [
+        record["weight_sync"]
+        for record in records
+        if isinstance(record.get("weight_sync"), dict)
+    ]
 
     metrics: dict[str, float | int | None] = {
         "val/diagnostics/record_count": len(records),
@@ -211,6 +217,21 @@ def summarize_validation_interactions(records: list[dict[str, Any]]) -> dict[str
         "val/diagnostics/win_transition_count": sum(row["won"] for row in plays),
         "val/diagnostics/terminal_loss_count": sum(row["done"] and not row["won"] for row in plays),
     }
+    if weight_syncs:
+        metrics.update({
+            "val/diagnostics/weight_sync_count_max": max(
+                int(sync["sync_count"]) for sync in weight_syncs
+            ),
+            "val/diagnostics/weight_sync_parameter_count_max": max(
+                int(sync["parameter_count"]) for sync in weight_syncs
+            ),
+            "val/diagnostics/weight_sync_element_count_max": max(
+                int(sync["element_count"]) for sync in weight_syncs
+            ),
+            "val/diagnostics/full_model_weight_sync_rate": _mean(
+                not bool(sync["is_lora"]) for sync in weight_syncs
+            ),
+        })
 
     for reward in (-1.0, -0.1, 0.5, 2.0, 10.0):
         label = str(reward).replace("-", "minus_").replace(".", "_")
