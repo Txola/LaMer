@@ -653,6 +653,11 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        # The rollout engine can reuse its sleeping weight allocation across
+        # environment turns. Force exactly one refresh after an optimizer step.
+        if hasattr(getattr(self, "rollout_sharding_manager", None), "mark_weights_dirty"):
+            self.rollout_sharding_manager.mark_weights_dirty()
+
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -793,6 +798,15 @@ class ActorRolloutRefWorker(Worker):
         # only support save and load ckpt for actor
         assert self._is_actor
 
+        # Full checkpoints materialize an FP32 model state on CPU. Discard the
+        # sleeping vLLM weight backup first to lower peak host RAM; the next
+        # rollout will synchronize the current actor weights once.
+        if not self._is_lora and hasattr(
+            getattr(self, "rollout_sharding_manager", None),
+            "discard_weight_backup",
+        ):
+            self.rollout_sharding_manager.discard_weight_backup()
+
         # LoRA-only checkpoints are written directly from the already-offloaded
         # CPU parameters. Loading the frozen base model onto CUDA here caused
         # the following vLLM wake-up to OOM on a 24 GB single-GPU setup.
@@ -857,6 +871,10 @@ class ActorRolloutRefWorker(Worker):
 
         if load_training_state and self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
+
+        # vLLM was initialized from model.path, not from this checkpoint.
+        if hasattr(getattr(self, "rollout_sharding_manager", None), "mark_weights_dirty"):
+            self.rollout_sharding_manager.mark_weights_dirty()
 
 
     # @register(dispatch_mode=Dispatch.ONE_TO_ALL)

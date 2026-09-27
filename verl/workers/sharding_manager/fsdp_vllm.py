@@ -111,8 +111,34 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.gen_random_states = None
 
         self.base_sync_done: bool = 'dummy' not in load_format
+        wrapped_module = self.module._fsdp_wrapped_module if fsdp_version(self.module) == 1 else self.module
+        # A safetensors-loaded full model initially matches the actor exactly.
+        # LoRA adapters and dummy-loaded models still require an initial sync.
+        self.weights_dirty = (
+            not self.base_sync_done or isinstance(wrapped_module, PeftModel)
+        )
         if is_version_ge(pkg='vllm', minver='0.7.3'):
             VLLMHijack.hijack()
+
+    def mark_weights_dirty(self):
+        """Require one actor-to-vLLM sync before the next generation."""
+        self.weights_dirty = True
+
+    def discard_weight_backup(self):
+        """Drop vLLM's CPU weight copy before a memory-heavy checkpoint."""
+        if vllm_version in ("0.5.4", "0.6.3"):
+            return
+
+        # The engine is sleeping at this boundary. Level-1 sleep owns a CPU
+        # copy of the inference weights; briefly restore only those weights,
+        # then level-2 sleep discards them instead of backing them up again.
+        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+            self.inference_engine.wake_up(tags=["weights"])
+        else:
+            self.inference_engine.wake_up()
+        self.inference_engine.sleep(level=2)
+        self.weights_dirty = True
+        get_torch_device().empty_cache()
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __enter__(self):
@@ -172,56 +198,57 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         # vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/device_allocator/cumem.py#L103
         get_torch_device().empty_cache()
 
-        log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
-        cpu_unsharded_actor = False
-        if self.offload_param:
-            # NO_SHARD state_dict() clones full weights. Keep an offloaded
-            # actor on CPU so those clones do not compete with vLLM for VRAM.
-            if (fsdp_version(self.module) == 1
-                    and not isinstance(wrapped_module, PeftModel)
-                    and all(not handle.uses_sharded_strategy
-                            for handle in self.module._all_handles)):
-                offload_fsdp_model_to_cpu(self.module)
-                cpu_unsharded_actor = True
-            else:
-                load_fsdp_model_to_gpu(self.module)
-
+        legacy_vllm = vllm_version in ("0.5.4", "0.6.3")
+        should_sync = legacy_vllm or self.weights_dirty
         peft_config = None
-        if isinstance(wrapped_module, PeftModel):
-            peft_config = wrapped_module.peft_config.get('default', None)
-            params = __collect_lora_params()
-            if self.base_sync_done and not params:
-                raise RuntimeError(
-                    "LoRA synchronization produced no adapter tensors; "
-                    "refusing to run vLLM with the unchanged base model"
-                )
-        else:
-            if cpu_unsharded_actor:
-                # Borrow CPU parameter views for this synchronous transfer.
-                # The actor is not updated until update_params() completes;
-                # cloning these views would duplicate the full FP32 model.
-                # FSDP.state_dict() would move them back to CUDA instead.
-                params = OrderedDict(
-                    (name.replace("_fsdp_wrapped_module.", ""), param.detach())
-                    for name, param in self.module.named_parameters(remove_duplicate=False)
-                    if name.split(".")[-1] != "_flat_param"
-                )
-                for module_name, module in self.module.named_modules():
-                    for name, buffer in module._buffers.items():
-                        if buffer is not None and name not in module._non_persistent_buffers_set:
-                            key = f"{module_name}.{name}" if module_name else name
-                            params[key.replace("_fsdp_wrapped_module.", "")] = buffer.detach().cpu().clone()
+        params = None
+        if should_sync:
+            log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
+            cpu_unsharded_actor = False
+            if self.offload_param:
+                # NO_SHARD state_dict() clones full weights. Keep an offloaded
+                # actor on CPU so those clones do not compete with vLLM for VRAM.
+                if (fsdp_version(self.module) == 1
+                        and not isinstance(wrapped_module, PeftModel)
+                        and all(not handle.uses_sharded_strategy
+                                for handle in self.module._all_handles)):
+                    offload_fsdp_model_to_cpu(self.module)
+                    cpu_unsharded_actor = True
+                else:
+                    load_fsdp_model_to_gpu(self.module)
+
+            if isinstance(wrapped_module, PeftModel):
+                peft_config = wrapped_module.peft_config.get('default', None)
+                params = __collect_lora_params()
+                if self.base_sync_done and not params:
+                    raise RuntimeError(
+                        "LoRA synchronization produced no adapter tensors; "
+                        "refusing to run vLLM with the unchanged base model"
+                    )
             else:
-                params = self.module.state_dict()
-        log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
+                if cpu_unsharded_actor:
+                    # Borrow CPU parameter views for this synchronous transfer.
+                    # The actor is not updated until update_params() completes;
+                    # cloning these views would duplicate the full FP32 model.
+                    # FSDP.state_dict() would move them back to CUDA instead.
+                    params = OrderedDict(
+                        (name.replace("_fsdp_wrapped_module.", ""), param.detach())
+                        for name, param in self.module.named_parameters(remove_duplicate=False)
+                        if name.split(".")[-1] != "_flat_param"
+                    )
+                    for module_name, module in self.module.named_modules():
+                        for name, buffer in module._buffers.items():
+                            if buffer is not None and name not in module._non_persistent_buffers_set:
+                                key = f"{module_name}.{name}" if module_name else name
+                                params[key.replace("_fsdp_wrapped_module.", "")] = buffer.detach().cpu().clone()
+                else:
+                    params = self.module.state_dict()
+            log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
 
         # Copy, not share memory
         load_format = "hf" if self.full_params else "dtensor"
 
-        if vllm_version in (
-            "0.5.4",
-            "0.6.3",
-        ):
+        if legacy_vllm:
             self.inference_engine.sync_model_weights(params, load_format=load_format)
             log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
             del params
@@ -231,13 +258,14 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             else:
                 self.inference_engine.wake_up()
 
-            # update model params
-            self.update_params(params, peft_config=peft_config)
-            log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
-            del params
-            if self.offload_param:
-                offload_fsdp_model_to_cpu(self.module)
-            get_torch_device().empty_cache()
+            if should_sync:
+                self.update_params(params, peft_config=peft_config)
+                self.weights_dirty = False
+                log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
+                del params
+                if self.offload_param:
+                    offload_fsdp_model_to_cpu(self.module)
+                get_torch_device().empty_cache()
 
             if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
                 self.inference_engine.wake_up(tags=["kv_cache"])
