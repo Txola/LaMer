@@ -44,8 +44,10 @@ else
     DEFAULT_VAL_TASK_COUNT=84
     DEFAULT_CAPTURE_GENERATION_DIAGNOSTICS=True
     DEFAULT_GROUPING_DIAGNOSTICS=False
-    DEFAULT_EXPERIMENT_NAME=alfworld_full_qwen3_4b_main
-    DEFAULT_OUTPUT_DIR="$REPO_ROOT/outputs/alfworld_full_multi_gpu/alfworld_full_qwen3_4b_main"
+    # Use a distinct stable name so this safer profile cannot accidentally
+    # resume the earlier microbatch-8 run from its saved parameters.
+    DEFAULT_EXPERIMENT_NAME=alfworld_full_qwen3_4b_main_mb4
+    DEFAULT_OUTPUT_DIR="$REPO_ROOT/outputs/alfworld_full_multi_gpu/alfworld_full_qwen3_4b_main_mb4"
     if [[ "$ALLOW_PRODUCTION" != 1 && "$DRY_RUN" != 1 ]]; then
         printf 'Production is guarded. Run a successful smoke test, then set ALLOW_PRODUCTION=1.\n' >&2
         exit 2
@@ -108,13 +110,16 @@ case "$HARDWARE_PROFILE" in
     large_96gb)
         PROFILE_N_GPUS=1
         PROFILE_TENSOR_PARALLEL_SIZE=1
-        PROFILE_ACTOR_MICRO_BATCH_SIZE=8
+        PROFILE_ACTOR_MICRO_BATCH_SIZE=4
         PROFILE_LOG_PROB_MICRO_BATCH_SIZE=32
         PROFILE_ACTOR_PARAM_OFFLOAD=False
-        # Microbatch 16 exhausted VRAM during backward, while CPU-offloading
-        # Adam caused the 62 GiB host to kill the worker. Keep Adam on GPU,
-        # use microbatch 8, and leave rollout headroom with a 35% vLLM budget.
+        # Keep Adam on GPU, but use microbatch 4 after microbatch 8 exhausted
+        # VRAM during a late backward pass. The effective PPO minibatch stays 64.
         PROFILE_ACTOR_OPTIMIZER_OFFLOAD=False
+        # vLLM sleep mode uses CuMemAllocator's memory pool, which rejects
+        # PyTorch expandable segments. Microbatch 4 is the OOM mitigation for
+        # this profile instead.
+        PROFILE_CUDA_EXPANDABLE_SEGMENTS=False
         PROFILE_GPU_MEMORY_UTILIZATION=0.35
         PROFILE_MAX_NUM_BATCHED_TOKENS=32768
         PROFILE_VLLM_ATTENTION_BACKEND=FLASH_ATTN
@@ -129,6 +134,7 @@ case "$HARDWARE_PROFILE" in
         PROFILE_LOG_PROB_MICRO_BATCH_SIZE=16
         PROFILE_ACTOR_PARAM_OFFLOAD=True
         PROFILE_ACTOR_OPTIMIZER_OFFLOAD=True
+        PROFILE_CUDA_EXPANDABLE_SEGMENTS=False
         PROFILE_GPU_MEMORY_UTILIZATION=0.6
         PROFILE_MAX_NUM_BATCHED_TOKENS=16384
         PROFILE_VLLM_ATTENTION_BACKEND=XFORMERS
@@ -148,6 +154,7 @@ ACTOR_MICRO_BATCH_SIZE=${ACTOR_MICRO_BATCH_SIZE:-$(saved_parameter ACTOR_MICRO_B
 LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE:-$(saved_parameter LOG_PROB_MICRO_BATCH_SIZE "$PROFILE_LOG_PROB_MICRO_BATCH_SIZE")}
 ACTOR_PARAM_OFFLOAD=${ACTOR_PARAM_OFFLOAD:-$(saved_parameter ACTOR_PARAM_OFFLOAD "$PROFILE_ACTOR_PARAM_OFFLOAD")}
 ACTOR_OPTIMIZER_OFFLOAD=${ACTOR_OPTIMIZER_OFFLOAD:-$(saved_parameter ACTOR_OPTIMIZER_OFFLOAD "$PROFILE_ACTOR_OPTIMIZER_OFFLOAD")}
+CUDA_EXPANDABLE_SEGMENTS=${CUDA_EXPANDABLE_SEGMENTS:-$(saved_parameter CUDA_EXPANDABLE_SEGMENTS "$PROFILE_CUDA_EXPANDABLE_SEGMENTS")}
 REF_PARAM_OFFLOAD=${REF_PARAM_OFFLOAD:-$(saved_parameter REF_PARAM_OFFLOAD True)}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-$(saved_parameter GPU_MEMORY_UTILIZATION "$PROFILE_GPU_MEMORY_UTILIZATION")}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-$(saved_parameter MAX_NUM_BATCHED_TOKENS "$PROFILE_MAX_NUM_BATCHED_TOKENS")}
@@ -167,7 +174,7 @@ PROJECT_NAME=${PROJECT_NAME:-$(saved_parameter PROJECT_NAME lamer)}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-$(saved_parameter EXPERIMENT_NAME "$DEFAULT_EXPERIMENT_NAME")}
 WANDB_RUN_ID=${WANDB_RUN_ID:-$(saved_parameter WANDB_RUN_ID "$EXPERIMENT_NAME")}
 
-for boolean_name in ACTOR_PARAM_OFFLOAD ACTOR_OPTIMIZER_OFFLOAD REF_PARAM_OFFLOAD CAPTURE_GENERATION_DIAGNOSTICS GROUPING_DIAGNOSTICS; do
+for boolean_name in ACTOR_PARAM_OFFLOAD ACTOR_OPTIMIZER_OFFLOAD CUDA_EXPANDABLE_SEGMENTS REF_PARAM_OFFLOAD CAPTURE_GENERATION_DIAGNOSTICS GROUPING_DIAGNOSTICS; do
     boolean_value=${!boolean_name}
     if [[ "$boolean_value" != True && "$boolean_value" != False ]]; then
         printf '%s must be True or False; got %s.\n' "$boolean_name" "$boolean_value" >&2
@@ -221,7 +228,7 @@ if [[ "$RUN_MODE" == production && ( "$TOTAL_STEPS" != 150 || "$TEST_FREQ" != 5 
     printf 'Production mode requires 150 steps, validation every 5 steps, and 84 validation tasks.\n' >&2; exit 2
 fi
 
-for immutable_name in RUN_MODE MODEL_PATH TRAIN_BATCH_SIZE GROUP_SIZE PPO_MINI_BATCH_SIZE TOTAL_STEPS TEST_FREQ SAVE_FREQ CHECKPOINT_POLICY CHECKPOINT_METRIC CHECKPOINT_METRIC_MODE VAL_TASK_COUNT NUM_ATTEMPTS MAX_TURNS_PER_ATTEMPT LEARNING_RATE ENV_SEED VAL_ENV_SEED ROLLOUT_SEED HARDWARE_PROFILE N_GPUS TENSOR_PARALLEL_SIZE ACTOR_MICRO_BATCH_SIZE LOG_PROB_MICRO_BATCH_SIZE ACTOR_PARAM_OFFLOAD ACTOR_OPTIMIZER_OFFLOAD REF_PARAM_OFFLOAD GPU_MEMORY_UTILIZATION MAX_NUM_BATCHED_TOKENS VLLM_ATTENTION_BACKEND CAPTURE_GENERATION_DIAGNOSTICS GROUPING_DIAGNOSTICS RAY_NUM_CPUS ENV_CPUS_PER_WORKER GAMES_PER_ENV_WORKER PROJECT_NAME EXPERIMENT_NAME WANDB_RUN_ID; do
+for immutable_name in RUN_MODE MODEL_PATH TRAIN_BATCH_SIZE GROUP_SIZE PPO_MINI_BATCH_SIZE TOTAL_STEPS TEST_FREQ SAVE_FREQ CHECKPOINT_POLICY CHECKPOINT_METRIC CHECKPOINT_METRIC_MODE VAL_TASK_COUNT NUM_ATTEMPTS MAX_TURNS_PER_ATTEMPT LEARNING_RATE ENV_SEED VAL_ENV_SEED ROLLOUT_SEED HARDWARE_PROFILE N_GPUS TENSOR_PARALLEL_SIZE ACTOR_MICRO_BATCH_SIZE LOG_PROB_MICRO_BATCH_SIZE ACTOR_PARAM_OFFLOAD ACTOR_OPTIMIZER_OFFLOAD CUDA_EXPANDABLE_SEGMENTS REF_PARAM_OFFLOAD GPU_MEMORY_UTILIZATION MAX_NUM_BATCHED_TOKENS VLLM_ATTENTION_BACKEND CAPTURE_GENERATION_DIAGNOSTICS GROUPING_DIAGNOSTICS RAY_NUM_CPUS ENV_CPUS_PER_WORKER GAMES_PER_ENV_WORKER PROJECT_NAME EXPERIMENT_NAME WANDB_RUN_ID; do
     assert_resume_parameter "$immutable_name" "${!immutable_name}"
 done
 
@@ -252,15 +259,20 @@ export VLLM_USE_V1=${VLLM_USE_V1:-0}
 export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-INFO}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-true}
 export TENSORBOARD_DIR
-if [[ ${PYTORCH_CUDA_ALLOC_CONF:-} == *"expandable_segments:True"* ]]; then
+if [[ "$CUDA_EXPANDABLE_SEGMENTS" == True ]]; then
+    # This launcher owns the allocator setting so the selected hardware profile
+    # is reproducible. It reduces fragmentation as rollout and FSDP alternate.
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+elif [[ ${PYTORCH_CUDA_ALLOC_CONF:-} == *"expandable_segments:"* ]]; then
     unset PYTORCH_CUDA_ALLOC_CONF
 fi
 if [[ "$TRAINER_LOGGER" == *wandb* ]]; then
     export WANDB_RUN_ID WANDB_RESUME=${WANDB_RESUME:-allow}
 fi
 
-validation_count=$(( (TOTAL_STEPS + TEST_FREQ - 1) / TEST_FREQ ))
-max_checkpoint_writes=$validation_count
+scheduled_validation_count=$(( (TOTAL_STEPS + TEST_FREQ - 1) / TEST_FREQ ))
+validation_count=$((scheduled_validation_count + 1))
+max_checkpoint_writes=$scheduled_validation_count
 all_checkpoint_gib=$((max_checkpoint_writes * EXPECTED_CKPT_GIB))
 retained_checkpoint_gib=$((MAX_ACTOR_CKPT_TO_KEEP * EXPECTED_CKPT_GIB))
 required_free_gib=$((retained_checkpoint_gib + EXPECTED_CKPT_GIB + 32))
@@ -270,8 +282,10 @@ available_disk_gib=$((available_disk_kib / 1024 / 1024))
 printf 'Run mode: %s\nHardware profile: %s\nOutput: %s\n' "$RUN_MODE" "$HARDWARE_PROFILE" "$OUTPUT_DIR"
 printf 'Distributed layout: %s GPUs, FSDP, tensor parallel %s, actor microbatch %s/GPU, log-prob microbatch %s/GPU.\n' \
     "$N_GPUS" "$TENSOR_PARALLEL_SIZE" "$ACTOR_MICRO_BATCH_SIZE" "$LOG_PROB_MICRO_BATCH_SIZE"
-printf 'Checkpoint plan: %s validations; at most %s writes including final, ~%s GiB each, ~%s GiB without pruning.\n' \
-    "$validation_count" "$max_checkpoint_writes" "$EXPECTED_CKPT_GIB" "$all_checkpoint_gib"
+printf 'CUDA expandable segments: %s. Validation plan: step 0 plus every %s steps (%s total).\n' \
+    "$CUDA_EXPANDABLE_SEGMENTS" "$TEST_FREQ" "$validation_count"
+printf 'Checkpoint plan: at most %s writes including final, ~%s GiB each, ~%s GiB without pruning.\n' \
+    "$max_checkpoint_writes" "$EXPECTED_CKPT_GIB" "$all_checkpoint_gib"
 printf 'Retention: strict best %s plus final/latest; at most %s checkpoints (~%s GiB).\n' \
     "$CHECKPOINT_METRIC" "$MAX_ACTOR_CKPT_TO_KEEP" "$retained_checkpoint_gib"
 printf 'Disk available: %s GiB; conservative launch requirement: %s GiB. Ray temp: %s\n' \
@@ -386,7 +400,7 @@ PY
 } > "$OUTPUT_DIR/software_versions.txt"
 
 {
-    for name in RUN_MODE HARDWARE_PROFILE MODEL_PATH TRAIN_BATCH_SIZE GROUP_SIZE PPO_MINI_BATCH_SIZE TOTAL_STEPS SAVE_FREQ TEST_FREQ CHECKPOINT_POLICY CHECKPOINT_METRIC CHECKPOINT_METRIC_MODE VAL_TASK_COUNT NUM_ATTEMPTS MAX_TURNS_PER_ATTEMPT LEARNING_RATE ENV_SEED TRAIN_ENV_SEED VAL_ENV_SEED ROLLOUT_SEED N_GPUS TENSOR_PARALLEL_SIZE ACTOR_MICRO_BATCH_SIZE LOG_PROB_MICRO_BATCH_SIZE ACTOR_PARAM_OFFLOAD ACTOR_OPTIMIZER_OFFLOAD REF_PARAM_OFFLOAD GPU_MEMORY_UTILIZATION MAX_NUM_BATCHED_TOKENS VLLM_ATTENTION_BACKEND CAPTURE_GENERATION_DIAGNOSTICS GROUPING_DIAGNOSTICS MAX_ACTOR_CKPT_TO_KEEP EXPECTED_CKPT_GIB RESUME_MODE TRAINER_LOGGER PROJECT_NAME EXPERIMENT_NAME WANDB_RUN_ID LATEST_CHECKPOINT_STEP OUTPUT_DIR CHECKPOINT_DIR TENSORBOARD_DIR RAY_TMPDIR; do
+    for name in RUN_MODE HARDWARE_PROFILE MODEL_PATH TRAIN_BATCH_SIZE GROUP_SIZE PPO_MINI_BATCH_SIZE TOTAL_STEPS SAVE_FREQ TEST_FREQ CHECKPOINT_POLICY CHECKPOINT_METRIC CHECKPOINT_METRIC_MODE VAL_TASK_COUNT NUM_ATTEMPTS MAX_TURNS_PER_ATTEMPT LEARNING_RATE ENV_SEED TRAIN_ENV_SEED VAL_ENV_SEED ROLLOUT_SEED N_GPUS TENSOR_PARALLEL_SIZE ACTOR_MICRO_BATCH_SIZE LOG_PROB_MICRO_BATCH_SIZE ACTOR_PARAM_OFFLOAD ACTOR_OPTIMIZER_OFFLOAD CUDA_EXPANDABLE_SEGMENTS REF_PARAM_OFFLOAD GPU_MEMORY_UTILIZATION MAX_NUM_BATCHED_TOKENS VLLM_ATTENTION_BACKEND CAPTURE_GENERATION_DIAGNOSTICS GROUPING_DIAGNOSTICS MAX_ACTOR_CKPT_TO_KEEP EXPECTED_CKPT_GIB RESUME_MODE TRAINER_LOGGER PROJECT_NAME EXPERIMENT_NAME WANDB_RUN_ID LATEST_CHECKPOINT_STEP OUTPUT_DIR CHECKPOINT_DIR TENSORBOARD_DIR RAY_TMPDIR; do
         printf '%s=%s\n' "$name" "${!name}"
     done
     printf 'LORA_RANK=0\n'
@@ -471,7 +485,9 @@ cmd=(
     "+env.val_seed=$VAL_ENV_SEED"
     "env.rollout.n=$GROUP_SIZE"
     "env.num_attempts=$NUM_ATTEMPTS"
+    "+env.val_num_attempts=$NUM_ATTEMPTS"
     +env.do_reflection=True
+    +env.val_do_reflection=True
     env.max_steps=30
     "env.max_turns=$MAX_TURNS_PER_ATTEMPT"
     +env.reflection_type=reflection_only
@@ -493,7 +509,7 @@ cmd=(
     "trainer.total_epochs=$TOTAL_STEPS"
     "trainer.total_training_steps=$TOTAL_STEPS"
     "trainer.resume_mode=$RESUME_MODE"
-    trainer.val_before_train=False
+    trainer.val_before_train=True
     trainer.log_val_generations=0
     "trainer.max_actor_ckpt_to_keep=$MAX_ACTOR_CKPT_TO_KEEP"
     trainer.max_critic_ckpt_to_keep=null
