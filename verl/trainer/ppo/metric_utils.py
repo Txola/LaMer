@@ -226,6 +226,99 @@ def compute_gigpo_group_metrics(batch: DataProto) -> Dict[str, float]:
         "gigpo/groups/successful_rollouts_std": float(success_counts.std()),
     }
 
+    # Measure diversity after collapsing adjust_batch padding copies. This is
+    # deliberately kept in memory and only hashes the first response plus the
+    # parsed ALFWorld action path, unlike the optional full diagnostic dumps.
+    diversity_fields = ("phase", "traj_idx", "turn_idx", "parsed_action")
+    if all(key in metadata for key in diversity_fields):
+        action_paths: dict[Any, dict[Any, dict[tuple[int, int], Any]]] = defaultdict(
+            lambda: defaultdict(dict)
+        )
+        first_play_record: dict[tuple[Any, Any], tuple[tuple[int, int], int]] = {}
+
+        for index, (uid, traj_uid, phase, traj_idx, turn_idx, action) in enumerate(
+            zip(
+                metadata["uid"],
+                metadata["traj_uid"],
+                metadata["phase"],
+                metadata["traj_idx"],
+                metadata["turn_idx"],
+                metadata["parsed_action"],
+            )
+        ):
+            if phase != "play":
+                continue
+            step_key = (int(traj_idx), int(turn_idx))
+            if isinstance(action, np.ndarray):
+                action = tuple(action.reshape(-1).tolist())
+            elif isinstance(action, list):
+                action = tuple(action)
+            action_paths[uid][traj_uid].setdefault(step_key, action)
+
+            trajectory_key = (uid, traj_uid)
+            if (
+                trajectory_key not in first_play_record
+                or step_key < first_play_record[trajectory_key][0]
+            ):
+                first_play_record[trajectory_key] = (step_key, index)
+
+        action_sequence_fractions = []
+        first_action_fractions = []
+        first_response_fractions = []
+        fully_collapsed_action_groups = []
+        responses = batch.batch.get("responses")
+        response_mask = batch.batch.get("response_mask")
+
+        for uid, trajectories in action_paths.items():
+            if not trajectories:
+                continue
+            action_sequences = []
+            first_actions = []
+            first_responses = []
+            for traj_uid, steps in trajectories.items():
+                ordered_steps = sorted(steps.items())
+                sequence = tuple(action for _, action in ordered_steps)
+                action_sequences.append(sequence)
+                if sequence:
+                    first_actions.append(sequence[0])
+
+                if responses is not None and response_mask is not None:
+                    first_record = first_play_record.get((uid, traj_uid))
+                    if first_record is not None:
+                        index = first_record[1]
+                        valid_tokens = responses[index][response_mask[index].bool()]
+                        first_responses.append(tuple(valid_tokens.detach().cpu().tolist()))
+
+            group_size = len(action_sequences)
+            if group_size:
+                unique_action_sequences = len(set(action_sequences))
+                action_sequence_fractions.append(unique_action_sequences / group_size)
+                fully_collapsed_action_groups.append(unique_action_sequences == 1)
+            if first_actions:
+                first_action_fractions.append(len(set(first_actions)) / len(first_actions))
+            if first_responses:
+                first_response_fractions.append(
+                    len(set(first_responses)) / len(first_responses)
+                )
+
+        if action_sequence_fractions:
+            metrics.update({
+                "gigpo/diversity/action_sequence_unique_fraction_mean": float(
+                    np.mean(action_sequence_fractions)
+                ),
+                "gigpo/diversity/fully_collapsed_action_group_fraction": float(
+                    np.mean(fully_collapsed_action_groups)
+                ),
+            })
+        if first_action_fractions:
+            metrics["gigpo/diversity/first_action_unique_fraction_mean"] = float(
+                np.mean(first_action_fractions)
+            )
+        if first_response_fractions:
+            metrics["gigpo/diversity/first_response_unique_fraction_mean"] = float(
+                np.mean(first_response_fractions)
+            )
+
     if "advantages" in batch.batch and "response_mask" in batch.batch:
         valid_advantages = torch.masked_select(
             batch.batch["advantages"], batch.batch["response_mask"].bool()
