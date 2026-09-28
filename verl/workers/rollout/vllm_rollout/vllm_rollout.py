@@ -117,6 +117,7 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        engine_kwargs.setdefault("seed", config.get("seed", 0))
         lora_kwargs = kwargs.pop('lora_kwargs', {})
         self.lora_kwargs = lora_kwargs
         self.inference_engine = LLM(
@@ -153,9 +154,10 @@ class vLLMRollout(BaseRollout):
         ):
             kwargs["detokenize"] = False
 
-        # supporting adding any sampling params from the config file
+        # Keep the rollout seed at engine scope. A shared SamplingParams seed
+        # clones generations for identical prompts in the same rollout group.
         for k in config.keys():
-            if hasattr(SamplingParams(), str(k)):
+            if str(k) != "seed" and hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
 
         print(f"kwargs: {kwargs}")

@@ -76,7 +76,7 @@ class FIREvLLMRollout(vLLMRollout):
                 kwargs_0["top_k"] = 16
             self.sampling_params.max_tokens = config.response_length - 1
             for k in config.keys():
-                if hasattr(SamplingParams(), str(k)):
+                if str(k) != "seed" and hasattr(SamplingParams(), str(k)):
                     kwargs_0[k] = config.get(k)
             self.sampling_params_0 = SamplingParams(**kwargs_0)
 

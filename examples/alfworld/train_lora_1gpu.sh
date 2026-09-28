@@ -186,6 +186,8 @@ if [[ "$TRAINER_LOGGER" == *tensorboard* ]]; then
 fi
 printf 'Validation uses %s fixed ID games with seed %s; OOD tasks are excluded.\n' "$VAL_TASK_COUNT" "$VAL_ENV_SEED"
 
+# The rollout seed is passed through vLLM engine_kwargs below. Putting it at
+# rollout.seed would also make it a shared request seed and clone task prompts.
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gigpo \
     "data.train_files=$OUTPUT_DIR/data/text/train.parquet" \
@@ -219,7 +221,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    "+actor_rollout_ref.rollout.seed=$ROLLOUT_SEED" \
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.seed=$ROLLOUT_SEED" \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.layered_summon=True \
     "actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION" \

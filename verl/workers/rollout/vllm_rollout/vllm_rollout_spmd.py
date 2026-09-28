@@ -157,6 +157,7 @@ class vLLMRollout(BaseRollout):
             llm_kwargs["limit_mm_per_prompt"] = limit_mm_per_prompt
         llm_kwargs.update(lora_kwargs)
         llm_kwargs.update(engine_kwargs)
+        self.engine_seed = llm_kwargs.get("seed", 0)
         self.inference_engine = LLM(**llm_kwargs)
 
         # Offload vllm model to reduce peak memory usage
@@ -172,9 +173,12 @@ class vLLMRollout(BaseRollout):
         if vllm_version != "0.3.1":
             kwargs["detokenize"] = False
 
-        # supporting adding any sampling params from the config file
+        # Support sampling parameters from the rollout config. ``seed`` is an
+        # engine-level reproducibility setting above, not a shared request
+        # seed: assigning it to SamplingParams makes identical prompts in the
+        # same GiGPO group generate identical completions.
         for k in config.keys():
-            if hasattr(SamplingParams(), str(k)):
+            if str(k) != "seed" and hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
 
         print(f"kwargs: {kwargs}")
@@ -505,7 +509,7 @@ class vLLMRollout(BaseRollout):
                 ),
                 "generation_do_sample": do_sample,
                 "generation_validate": is_validate,
-                "generation_engine_seed": self.config.get("seed", 0),
+                "generation_engine_seed": self.engine_seed,
             }
             for key, value in diagnostic_values.items():
                 values = np.empty(batch_size, dtype=object)

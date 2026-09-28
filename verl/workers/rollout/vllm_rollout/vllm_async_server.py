@@ -156,8 +156,10 @@ class AsyncvLLMServer(AsyncServerBase):
             logprobs=0,
             max_tokens=config.response_length,
         )
+        # Keep the rollout seed at engine scope. A shared SamplingParams seed
+        # clones generations for identical prompts in the same rollout group.
         for k in config.keys():
-            if hasattr(SamplingParams(), str(k)):
+            if str(k) != "seed" and hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
         print(f"override_generation_config: {kwargs}")
 
@@ -180,7 +182,7 @@ class AsyncvLLMServer(AsyncServerBase):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
-            seed=self.vllm_dp_rank,
+            seed=config.get("seed", 0) + self.vllm_dp_rank,
         )
 
         # init async llm engine
