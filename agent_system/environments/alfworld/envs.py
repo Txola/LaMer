@@ -333,5 +333,76 @@ class AlfworldEnvs(gym.Env):
         for worker in self.workers:
             ray.kill(worker)
 
+
+class LocalAlfworldEnv(gym.Env):
+    """One in-process text ALFWorld game for an asynchronous agent session.
+
+    The legacy rollout path batches games behind Ray actors.  Modern VERL
+    already distributes agent sessions across Ray workers, so creating another
+    Ray actor per session would add nested scheduling and would block the
+    worker's asyncio event loop on ``ray.get``.  This wrapper keeps the same
+    TextWorld and reward behavior while giving one agent-loop coroutine its own
+    isolated game state.
+    """
+
+    def __init__(self, alf_config_path, gamefile, seed=0, eval_dataset="eval_all"):
+        super().__init__()
+        config = load_config_file(alf_config_path)
+        config["env"]["textworld_asynchronous"] = False
+        env_type = config["env"]["type"]
+        base_env = get_environment(env_type)(config, train_eval=eval_dataset)
+        if gamefile not in base_env.game_files:
+            raise ValueError(
+                f"Game {gamefile!r} is not part of ALFWorld split {eval_dataset!r}"
+            )
+
+        base_env.game_files = [gamefile]
+        base_env.num_games = 1
+        self.multi_modal = env_type == "AlfredThorEnv"
+        if self.multi_modal:
+            raise ValueError("LocalAlfworldEnv currently supports text ALFWorld only")
+
+        self.env = base_env.init_env(batch_size=1)
+        self.env.seed(seed)
+        self.env._gamefiles_iterator = cycle([gamefile])
+        self.num_processes = 1
+        self.prev_admissible_commands = [None]
+
+    @staticmethod
+    def _split_infos(infos):
+        return [{key: values[0] for key, values in infos.items()}]
+
+    def reset(self):
+        observations, infos = self.env.reset()
+        split_infos = self._split_infos(infos)
+        self.prev_admissible_commands[0] = split_infos[0]["admissible_commands"]
+        return list(observations), None, split_infos
+
+    def step(self, actions):
+        if len(actions) != 1:
+            raise ValueError("LocalAlfworldEnv accepts exactly one action")
+        observations, _, dones, infos = self.env.step(actions)
+        split_infos = self._split_infos(infos)
+        self.prev_admissible_commands[0] = split_infos[0]["admissible_commands"]
+        rewards = [compute_reward(split_infos[0], self.multi_modal)]
+        return list(observations), None, rewards, list(dones), split_infos
+
+    def restart(self):
+        self.env.last_commands = [None]
+        self.env.obs, infos = self.env.batch_env.reset()
+        split_infos = self._split_infos(infos)
+        self.prev_admissible_commands[0] = split_infos[0]["admissible_commands"]
+        return list(self.env.obs), None, split_infos
+
+    @property
+    def get_admissible_commands(self):
+        return self.prev_admissible_commands
+
+    def close(self):
+        close = getattr(self.env, "close", None)
+        if close is not None:
+            close()
+
+
 def build_alfworld_envs(alf_config_path, seed, env_num, group_n, is_train=True, env_kwargs={}):
     return AlfworldEnvs(alf_config_path, seed, env_num, group_n, is_train, env_kwargs)

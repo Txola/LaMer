@@ -1,0 +1,2 @@
+- name: alfworld_agent
+  _target_: agent_system.multi_turn_rollout.alfworld_agent_loop.AlfWorldAgentLoop
