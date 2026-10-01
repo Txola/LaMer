@@ -61,6 +61,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.do_reflection = do_reflection
         self.reflection_type = config.env.get('reflection_type', 'reflection_only')
         assert self.reflection_type in ['history_and_reflection', 'reflection_only', 'history_only']
+        self.additional_play_contexts = ['' for _ in range(self.num_processes)]
+        self.additional_reflection_contexts = ['' for _ in range(self.num_processes)]
         ## curr_traj_idx is used to track the current trajectory index for MetaRL
         self.curr_turn_idx = 0
         self.curr_traj_idx = 0
@@ -85,6 +87,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.init_states = text_obs
         ## reflections 
         self.reflections = [{} for _ in range(self.num_processes)]
+        self.additional_play_contexts = ['' for _ in range(self.num_processes)]
+        self.additional_reflection_contexts = ['' for _ in range(self.num_processes)]
         ## curr_traj_idx is used to track the current trajectory index for MetaRL
         self.curr_turn_idx = 0
         self.curr_traj_idx = 0 
@@ -92,8 +96,13 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         full_text_obs = self.build_text_obs(self.envs.get_admissible_commands, phase='play')
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
     
-    def reflect(self):
+    def reflect(self, additional_contexts=None):
         '''Get prompts for reflect phase.'''
+        if additional_contexts is None:
+            additional_contexts = ['' for _ in range(self.num_processes)]
+        if len(additional_contexts) != self.num_processes:
+            raise ValueError("additional_contexts must match the environment batch")
+        self.additional_reflection_contexts = list(additional_contexts)
         infos = [{
                 "action_is_valid": True,
                 "won": False,
@@ -109,11 +118,39 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
         return observations, infos
 
+    def reflect_for_paired_retry(self, attempt1_turn_idx, additional_contexts):
+        """Build a diagnostic reflection prompt from the stored first attempt."""
+        self.curr_traj_idx = 0
+        self.curr_turn_idx = attempt1_turn_idx
+        return self.reflect(additional_contexts)
+
     def restart(self):
         ''' Used for 2nd or N-th attempts '''
         text_obs, image_obs, infos = self.envs.restart()
         self.curr_traj_idx += 1
         self.curr_turn_idx = 0
+        self.pre_text_obs = text_obs
+        full_text_obs = self.build_text_obs(self.envs.get_admissible_commands, phase='play')
+        for info, task_type in zip(infos, self.task_types):
+            info['task_type'] = task_type
+        return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
+
+    def restart_for_paired_retry(self, own_reflections, additional_contexts):
+        """Reset trial two while preserving the exact stored trial-one context.
+
+        This is used only by the frozen-policy peer-reflection diagnostic. It
+        permits several paired trial-two branches without replaying trial one.
+        """
+        if len(own_reflections) != self.num_processes:
+            raise ValueError("own_reflections must match the environment batch")
+        if len(additional_contexts) != self.num_processes:
+            raise ValueError("additional_contexts must match the environment batch")
+        text_obs, image_obs, infos = self.envs.restart()
+        self.curr_traj_idx = 1
+        self.curr_turn_idx = 0
+        self.memories[1].reset(self.num_processes)
+        self.reflections = [{0: value} for value in own_reflections]
+        self.additional_play_contexts = list(additional_contexts)
         self.pre_text_obs = text_obs
         full_text_obs = self.build_text_obs(self.envs.get_admissible_commands, phase='play')
         for info, task_type in zip(infos, self.task_types):
@@ -234,7 +271,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 past_traj=past_trajs[i],
                 admissible_actions=reformatted_admissible_actions,
                 reflection=self.reflections[i],
-                reflection_type=self.reflection_type
+                reflection_type=self.reflection_type,
+                additional_context=(
+                    self.additional_play_contexts[i]
+                    if phase == 'play'
+                    else self.additional_reflection_contexts[i]
+                ),
             )
 
             postprocess_text_obs.append(obs)

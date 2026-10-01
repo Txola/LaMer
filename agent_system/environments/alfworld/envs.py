@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 import ray
+from itertools import cycle
 
 from .alfworld.agents.environment import get_environment
 
@@ -72,18 +73,24 @@ class AlfworldWorker:
         game_files=None,
         batch_size=1,
         repeat_game_within_batch=False,
+        preserve_game_order=False,
     ):
         # Evaluation workers receive a fixed game pool whose size equals their
         # internal batch. Every game is therefore loaded exactly once, while a
         # small number of Ray processes can host the complete evaluation set.
-        if game_files is not None:
+        if game_files is not None and preserve_game_order:
             base_env.game_files = list(game_files)
             base_env.num_games = len(game_files)
             batch_size = len(game_files)
         self.batch_size = batch_size
         self.env = base_env.init_env(batch_size=batch_size)
         self.env.seed(seed)
-        if repeat_game_within_batch:
+        if game_files is not None:
+            # Evaluation supplies an explicit ordered game list. TextWorld's
+            # seed() shuffles that list before the first reset, which breaks
+            # same-task diagnostic groups and makes row order incidental.
+            self.env._gamefiles_iterator = cycle(list(game_files))
+        elif repeat_game_within_batch:
             self.env._gamefiles_iterator = repeated_shuffled_game_cycle(
                 self.env.gamefiles, repeats=batch_size, seed=seed
             )
@@ -133,6 +140,7 @@ class AlfworldEnvs(gym.Env):
         self.num_cpus_per_worker = float(env_kwargs.get('num_cpus_per_worker', 0.1))
         self.num_gpus_per_worker = float(env_kwargs.get('num_gpus_per_worker', 0))
         self.games_per_worker = int(env_kwargs.get('games_per_worker', 32))
+        self.preserve_game_order = bool(env_kwargs.get('preserve_game_order', False))
         if self.games_per_worker <= 0:
             raise ValueError("games_per_worker must be positive")
 
@@ -146,6 +154,14 @@ class AlfworldEnvs(gym.Env):
             rng = np.random.RandomState(seed)
             indices = rng.permutation(len(base_env.game_files))[:env_num]
             evaluation_games = [base_env.game_files[index] for index in indices]
+            # A diagnostic may request independent rollouts of each exact
+            # evaluation game. Standard validation uses group_n=1 and is
+            # therefore unchanged.
+            evaluation_games = [
+                gamefile
+                for gamefile in evaluation_games
+                for _ in range(group_n)
+            ]
 
         # Training uses one Ray actor per task group. Each actor hosts the
         # group's rollouts as a synchronous TextWorld batch and repeats the
@@ -179,6 +195,7 @@ class AlfworldEnvs(gym.Env):
                 game_files,
                 worker_size,
                 repeat_game,
+                self.preserve_game_order,
             )
             self.workers.append(worker)
             self.worker_sizes.append(worker_size)
