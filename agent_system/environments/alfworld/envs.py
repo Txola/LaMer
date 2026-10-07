@@ -1,4 +1,6 @@
+import asyncio
 import os
+import resource
 import yaml
 import gymnasium as gym
 from gymnasium import spaces
@@ -6,6 +8,9 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 import ray
+from contextlib import asynccontextmanager
+from copy import copy
+from functools import lru_cache
 from itertools import cycle
 
 from .alfworld.agents.environment import get_environment
@@ -347,10 +352,13 @@ class LocalAlfworldEnv(gym.Env):
 
     def __init__(self, alf_config_path, gamefile, seed=0, eval_dataset="eval_all"):
         super().__init__()
-        config = load_config_file(alf_config_path)
-        config["env"]["textworld_asynchronous"] = False
-        env_type = config["env"]["type"]
-        base_env = get_environment(env_type)(config, train_eval=eval_dataset)
+        self.alf_config_path = os.path.realpath(alf_config_path)
+        self.environment_signature = _local_alfworld_environment_signature(
+            self.alf_config_path, eval_dataset
+        )
+        base_env = copy(
+            _local_alfworld_base_environment(self.alf_config_path, eval_dataset)
+        )
         if gamefile not in base_env.game_files:
             raise ValueError(
                 f"Game {gamefile!r} is not part of ALFWorld split {eval_dataset!r}"
@@ -358,15 +366,53 @@ class LocalAlfworldEnv(gym.Env):
 
         base_env.game_files = [gamefile]
         base_env.num_games = 1
-        self.multi_modal = env_type == "AlfredThorEnv"
+        self.multi_modal = base_env.config["env"]["type"] == "AlfredThorEnv"
         if self.multi_modal:
             raise ValueError("LocalAlfworldEnv currently supports text ALFWorld only")
 
         self.env = base_env.init_env(batch_size=1)
-        self.env.seed(seed)
-        self.env._gamefiles_iterator = cycle([gamefile])
         self.num_processes = 1
         self.prev_admissible_commands = [None]
+        self.configure(gamefile, seed=seed, eval_dataset=eval_dataset)
+
+    def configure(self, gamefile, seed=0, eval_dataset="eval_all"):
+        """Select the next isolated game without rebuilding the TextWorld stack."""
+        signature = _local_alfworld_environment_signature(
+            self.alf_config_path, eval_dataset
+        )
+        if signature != self.environment_signature:
+            raise ValueError(
+                "Cannot reuse an ALFWorld environment across incompatible wrapper "
+                f"configurations: {self.environment_signature!r} != {signature!r}"
+            )
+
+        base_env = _local_alfworld_base_environment(
+            self.alf_config_path, eval_dataset
+        )
+        if gamefile not in base_env.game_files:
+            raise ValueError(
+                f"Game {gamefile!r} is not part of ALFWorld split {eval_dataset!r}"
+            )
+
+        # TextworldBatchGymEnv.reset() consumes this iterator, closes the
+        # previously loaded interpreter, loads this exact game and resets all
+        # mutable game state.  Keeping the outer wrapper avoids repeatedly
+        # registering environments and constructing wrapper/interpreter stacks.
+        self.env.gamefiles = [gamefile]
+        self.env.seed(seed)
+        self.env._gamefiles_iterator = cycle([gamefile])
+        self.prev_admissible_commands = [None]
+
+    def prepare_for_pool(self):
+        """Drop references to trajectory data before returning this slot."""
+        self.prev_admissible_commands = [None]
+        self.env.last_commands = [None]
+        self.env.obs = None
+        # SyncBatchEnv caches the complete result of the last step to implement
+        # terminal-state behavior. The next reset always overwrites this field,
+        # so retaining it while idle only keeps stale observations/infos alive.
+        if self.env.batch_env is not None:
+            self.env.batch_env.last = [None]
 
     @staticmethod
     def _split_infos(infos):
@@ -402,6 +448,142 @@ class LocalAlfworldEnv(gym.Env):
         close = getattr(self.env, "close", None)
         if close is not None:
             close()
+
+
+@lru_cache(maxsize=None)
+def _local_alfworld_base_environment(alf_config_path, eval_dataset):
+    """Scan and cache one immutable game catalogue per split and process."""
+    config = load_config_file(alf_config_path)
+    config["env"]["textworld_asynchronous"] = False
+    env_type = config["env"]["type"]
+    return get_environment(env_type)(config, train_eval=eval_dataset)
+
+
+@lru_cache(maxsize=None)
+def _local_alfworld_environment_signature(alf_config_path, eval_dataset):
+    """Describe settings that affect the TextWorld wrapper construction."""
+    base_env = _local_alfworld_base_environment(alf_config_path, eval_dataset)
+    domain_randomization = bool(
+        base_env.config["env"].get("domain_randomization", False)
+        if eval_dataset == "train"
+        else False
+    )
+    return (
+        base_env.config["env"]["type"],
+        domain_randomization,
+        base_env.config["general"]["training_method"],
+    )
+
+
+def _process_rss_gb():
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Linux reports KiB; macOS reports bytes. ALFWorld training runs on Linux,
+    # but retaining the distinction keeps local diagnostics meaningful.
+    divisor = 1024**2 if os.uname().sysname == "Linux" else 1024**3
+    return rss / divisor
+
+
+class LocalAlfworldEnvPool:
+    """Bound the number of reusable TextWorld environments in one Ray worker."""
+
+    def __init__(self, capacity):
+        if capacity <= 0:
+            raise ValueError("ALFWorld environment pool capacity must be positive")
+        self.capacity = int(capacity)
+        self._idle = asyncio.LifoQueue(maxsize=self.capacity)
+        self._allocation_lock = asyncio.Lock()
+        self._size = 0
+        self._leases = 0
+
+    async def acquire(self, alf_config_path, gamefile, seed=0, eval_dataset="eval_all"):
+        try:
+            local_env = self._idle.get_nowait()
+        except asyncio.QueueEmpty:
+            create = False
+            async with self._allocation_lock:
+                if self._size < self.capacity:
+                    self._size += 1
+                    create = True
+            if create:
+                try:
+                    local_env = LocalAlfworldEnv(
+                        alf_config_path,
+                        gamefile,
+                        seed=seed,
+                        eval_dataset=eval_dataset,
+                    )
+                except BaseException:
+                    async with self._allocation_lock:
+                        self._size -= 1
+                    raise
+                print(
+                    "ALFWorld environment pool allocated "
+                    f"slot {self._size}/{self.capacity}; "
+                    f"worker peak RSS={_process_rss_gb():.3f} GiB"
+                )
+                return local_env
+            local_env = await self._idle.get()
+
+        try:
+            local_env.configure(
+                gamefile,
+                seed=seed,
+                eval_dataset=eval_dataset,
+            )
+        except BaseException:
+            local_env.close()
+            async with self._allocation_lock:
+                self._size -= 1
+            raise
+        return local_env
+
+    async def release(self, local_env):
+        local_env.prepare_for_pool()
+        self._leases += 1
+        self._idle.put_nowait(local_env)
+        if self._leases % self.capacity == 0:
+            print(
+                "ALFWorld environment pool reused "
+                f"{self._leases} leases across {self._size} slots; "
+                f"worker peak RSS={_process_rss_gb():.3f} GiB"
+            )
+
+    @asynccontextmanager
+    async def lease(self, alf_config_path, gamefile, seed=0, eval_dataset="eval_all"):
+        local_env = await self.acquire(
+            alf_config_path,
+            gamefile,
+            seed=seed,
+            eval_dataset=eval_dataset,
+        )
+        try:
+            yield local_env
+        finally:
+            await self.release(local_env)
+
+
+_LOCAL_ALFWORLD_ENV_POOLS = {}
+
+
+def get_local_alfworld_env_pool(
+    alf_config_path,
+    eval_dataset,
+    capacity,
+):
+    """Return the process-local pool compatible with this ALFWorld split."""
+    config_path = os.path.realpath(alf_config_path)
+    signature = _local_alfworld_environment_signature(config_path, eval_dataset)
+    # asyncio synchronization primitives belong to the event loop that drives
+    # them. Ray uses one persistent loop per async actor; including it in the
+    # key also keeps standalone callers that use several asyncio.run() calls
+    # from accidentally reusing a queue owned by an already-closed loop.
+    event_loop = asyncio.get_running_loop()
+    key = (config_path, signature, int(capacity), id(event_loop))
+    pool = _LOCAL_ALFWORLD_ENV_POOLS.get(key)
+    if pool is None:
+        pool = LocalAlfworldEnvPool(capacity)
+        _LOCAL_ALFWORLD_ENV_POOLS[key] = pool
+    return pool
 
 
 def build_alfworld_envs(alf_config_path, seed, env_num, group_n, is_train=True, env_kwargs={}):

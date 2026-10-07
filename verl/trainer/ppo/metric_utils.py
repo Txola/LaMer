@@ -191,9 +191,10 @@ def compute_gigpo_group_metrics(batch: DataProto) -> Dict[str, float]:
     id and then grouped by the task-level uid.
     """
     metadata = batch.non_tensor_batch
+    reflection_metrics = compute_reflection_step_group_metrics(batch)
     required = ("uid", "traj_uid", "episode_rewards")
     if any(key not in metadata for key in required):
-        return {}
+        return reflection_metrics
 
     rollout_groups: dict[Any, dict[Any, bool]] = defaultdict(dict)
     for uid, traj_uid, reward in zip(
@@ -206,7 +207,7 @@ def compute_gigpo_group_metrics(batch: DataProto) -> Dict[str, float]:
 
     outcomes = [list(group.values()) for group in rollout_groups.values() if group]
     if not outcomes:
-        return {}
+        return reflection_metrics
 
     group_sizes = np.asarray([len(group) for group in outcomes], dtype=np.float64)
     success_counts = np.asarray([sum(group) for group in outcomes], dtype=np.float64)
@@ -215,6 +216,7 @@ def compute_gigpo_group_metrics(batch: DataProto) -> Dict[str, float]:
     mixed = ~(all_failure | all_success)
 
     metrics = {
+        **reflection_metrics,
         "gigpo/groups/count": float(len(outcomes)),
         "gigpo/groups/size_mean": float(group_sizes.mean()),
         "gigpo/groups/size_min": float(group_sizes.min()),
@@ -335,6 +337,85 @@ def compute_gigpo_group_metrics(batch: DataProto) -> Dict[str, float]:
                     valid_advantages.std(unbiased=False).detach().item()
                 ),
             })
+
+    return metrics
+
+
+def compute_reflection_step_group_metrics(batch: DataProto) -> Dict[str, float]:
+    """Report optimizer-visible sizes of GiGPO groups containing reflections.
+
+    This mirrors ``build_step_group``: records share a group exactly when both
+    their task-level ``uid`` and hashable ``anchor_obs`` match.  Group sizes
+    include any copies added by ``adjust_batch`` because those copies also
+    participate in the actual centering operation.  Distinct-trajectory
+    metrics expose how many sibling trajectories contribute, collapsing both
+    padding copies and multiple reflection attempts from one trajectory.
+    """
+    metadata = batch.non_tensor_batch
+    required = ("uid", "anchor_obs", "phase")
+    if any(key not in metadata for key in required):
+        return {}
+
+    # Import locally to keep the general metric module's import surface small.
+    from verl.trainer.ppo.core_gigpo import to_hashable
+
+    group_members: dict[tuple[Any, Any], list[int]] = defaultdict(list)
+    reflection_keys = set()
+    reflection_record_count = 0
+    for index, (uid, anchor, phase) in enumerate(
+        zip(metadata["uid"], metadata["anchor_obs"], metadata["phase"])
+    ):
+        key = (to_hashable(uid), to_hashable(anchor))
+        group_members[key].append(index)
+        if phase == "reflect":
+            reflection_keys.add(key)
+            reflection_record_count += 1
+
+    prefix = "gigpo/reflection_step_groups"
+    if not reflection_keys:
+        return {
+            f"{prefix}/count": 0.0,
+            f"{prefix}/records": 0.0,
+            f"{prefix}/singleton_fraction": 0.0,
+            f"{prefix}/size_mean": 0.0,
+            f"{prefix}/size_min": 0.0,
+            f"{prefix}/size_max": 0.0,
+        }
+
+    sizes = np.asarray(
+        [len(group_members[key]) for key in reflection_keys], dtype=np.int64
+    )
+    metrics = {
+        f"{prefix}/count": float(len(sizes)),
+        f"{prefix}/records": float(reflection_record_count),
+        f"{prefix}/singleton_fraction": float(np.mean(sizes == 1)),
+        f"{prefix}/size_mean": float(sizes.mean()),
+        f"{prefix}/size_min": float(sizes.min()),
+        f"{prefix}/size_max": float(sizes.max()),
+    }
+    for size, count in zip(*np.unique(sizes, return_counts=True)):
+        metrics[f"{prefix}/size_histogram/{int(size)}"] = float(count)
+
+    if "traj_uid" in metadata:
+        distinct_sizes = np.asarray(
+            [
+                len({to_hashable(metadata["traj_uid"][i]) for i in group_members[key]})
+                for key in reflection_keys
+            ],
+            dtype=np.int64,
+        )
+        metrics.update({
+            f"{prefix}/distinct_trajectory_singleton_fraction": float(
+                np.mean(distinct_sizes == 1)
+            ),
+            f"{prefix}/distinct_trajectory_size_mean": float(distinct_sizes.mean()),
+            f"{prefix}/distinct_trajectory_size_min": float(distinct_sizes.min()),
+            f"{prefix}/distinct_trajectory_size_max": float(distinct_sizes.max()),
+        })
+        for size, count in zip(*np.unique(distinct_sizes, return_counts=True)):
+            metrics[
+                f"{prefix}/distinct_trajectory_size_histogram/{int(size)}"
+            ] = float(count)
 
     return metrics
 
