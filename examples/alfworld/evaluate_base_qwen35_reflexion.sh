@@ -25,11 +25,20 @@ REFLECTION_TYPE=${REFLECTION_TYPE:-reflection_only}
 EVAL_TEMPERATURE=${EVAL_TEMPERATURE:-0.7}
 EVAL_TOP_P=${EVAL_TOP_P:-0.8}
 EVAL_TOP_K=${EVAL_TOP_K:-20}
+PRESENCE_PENALTY=${PRESENCE_PENALTY:-1.5}
+BRIEF_RESPONSE_INSTRUCTION=${BRIEF_RESPONSE_INSTRUCTION:-False}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1024}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.50}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-32768}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-64}
-AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-8}
+LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE:-1}
+CALCULATE_LOG_PROBS=${CALCULATE_LOG_PROBS:-False}
+AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-16}
 RAY_NUM_CPUS=${RAY_NUM_CPUS:-18}
+TRAJECTORY_SAMPLES_PER_TASK=${TRAJECTORY_SAMPLES_PER_TASK:-1}
+TRAJECTORY_SAMPLE_SEED=${TRAJECTORY_SAMPLE_SEED:-0}
 ALFWORLD_DATA=${ALFWORLD_DATA:-$HOME/.cache/alfworld}
 RAY_TMPDIR=${RAY_TMPDIR:-/tmp/lamer-q35-$UID}
 
@@ -50,8 +59,13 @@ if [[ ! -d "$ALFWORLD_DATA/json/valid_task_balanced126" ]]; then
     printf 'Missing prepared ALFWorld balanced126 data under %s.\n' "$ALFWORLD_DATA" >&2
     exit 2
 fi
+if ((MAX_MODEL_LEN < MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)); then
+    printf 'MAX_MODEL_LEN=%s must be at least MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH=%s.\n' \
+        "$MAX_MODEL_LEN" "$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))" >&2
+    exit 2
+fi
 
-mkdir -p "$EVAL_DIR/data" "$EVAL_DIR/hydra" "$RAY_TMPDIR"
+mkdir -p "$EVAL_DIR/data" "$EVAL_DIR/hydra" "$EVAL_DIR/validation_traces" "$RAY_TMPDIR"
 EVAL_DIR=$(cd -- "$EVAL_DIR" && pwd)
 export ALFWORLD_DATA RAY_TMPDIR
 export HF_HOME=$COMPAT_DIR/hf-cache
@@ -90,11 +104,20 @@ REFLECTION_TYPE=$REFLECTION_TYPE
 EVAL_TEMPERATURE=$EVAL_TEMPERATURE
 EVAL_TOP_P=$EVAL_TOP_P
 EVAL_TOP_K=$EVAL_TOP_K
+PRESENCE_PENALTY=$PRESENCE_PENALTY
+BRIEF_RESPONSE_INSTRUCTION=$BRIEF_RESPONSE_INSTRUCTION
+MAX_PROMPT_LENGTH=$MAX_PROMPT_LENGTH
+MAX_RESPONSE_LENGTH=$MAX_RESPONSE_LENGTH
+MAX_MODEL_LEN=$MAX_MODEL_LEN
 GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION
 MAX_NUM_BATCHED_TOKENS=$MAX_NUM_BATCHED_TOKENS
 MAX_NUM_SEQS=$MAX_NUM_SEQS
+LOG_PROB_MICRO_BATCH_SIZE=$LOG_PROB_MICRO_BATCH_SIZE
+CALCULATE_LOG_PROBS=$CALCULATE_LOG_PROBS
 AGENT_LOOP_WORKERS=$AGENT_LOOP_WORKERS
 RAY_NUM_CPUS=$RAY_NUM_CPUS
+TRAJECTORY_SAMPLES_PER_TASK=$TRAJECTORY_SAMPLES_PER_TASK
+TRAJECTORY_SAMPLE_SEED=$TRAJECTORY_SAMPLE_SEED
 RAY_TMPDIR=$RAY_TMPDIR
 EOF
 
@@ -102,6 +125,12 @@ printf 'Evaluating Qwen3.5-9B on %s fixed balanced ALFWorld tasks.\n' "$EVAL_TAS
 printf 'Protocol: %sx%s, reflection=%s, validation seed=%s, rollout seed=%s.\n' \
     "$NUM_ATTEMPTS" "$MAX_TURNS_PER_ATTEMPT" "$DO_REFLECTION" \
     "$VAL_ENV_SEED" "$ROLLOUT_SEED"
+printf 'Response controls: brief instruction=%s, response cap=%s tokens.\n' \
+    "$BRIEF_RESPONSE_INSTRUCTION" "$MAX_RESPONSE_LENGTH"
+if ((TRAJECTORY_SAMPLES_PER_TASK > 0)); then
+    printf 'Writing %s Markdown trajectory sample(s) per task type under %s/validation_traces.\n' \
+        "$TRAJECTORY_SAMPLES_PER_TASK" "$EVAL_DIR"
+fi
 
 started=$(date +%s)
 set +e
@@ -113,8 +142,8 @@ cd "$VERL_DIR"
     "data.val_files=$EVAL_DIR/data/test.parquet" \
     data.train_batch_size=1 \
     "data.val_batch_size=$EVAL_TASK_COUNT" \
-    data.max_prompt_length=4096 \
-    data.max_response_length=1024 \
+    "data.max_prompt_length=$MAX_PROMPT_LENGTH" \
+    "data.max_response_length=$MAX_RESPONSE_LENGTH" \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=1 \
     data.dataloader_num_workers=0 \
@@ -150,9 +179,11 @@ cd "$VERL_DIR"
     actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.rollout.max_model_len=5120 \
+    "actor_rollout_ref.rollout.max_model_len=$MAX_MODEL_LEN" \
     "actor_rollout_ref.rollout.max_num_batched_tokens=$MAX_NUM_BATCHED_TOKENS" \
     "actor_rollout_ref.rollout.max_num_seqs=$MAX_NUM_SEQS" \
+    "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE" \
+    "actor_rollout_ref.rollout.calculate_log_probs=$CALCULATE_LOG_PROBS" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     "actor_rollout_ref.rollout.val_kwargs.temperature=$EVAL_TEMPERATURE" \
@@ -189,7 +220,13 @@ cd "$VERL_DIR"
     "+env.val_do_reflection=$DO_REFLECTION" \
     "+env.max_turns=$MAX_TURNS_PER_ATTEMPT" \
     "+env.reflection_type=$REFLECTION_TYPE" \
+    "+env.presence_penalty=$PRESENCE_PENALTY" \
+    "+env.brief_response_instruction=$BRIEF_RESPONSE_INSTRUCTION" \
     "+env.alfworld.eval_dataset=$EVAL_DATASET" \
+    "+env.validation_trace_dir=$EVAL_DIR/validation_traces" \
+    "+env.validation_trajectory_samples_per_task=$TRAJECTORY_SAMPLES_PER_TASK" \
+    "+env.validation_trajectory_sample_seed=$TRAJECTORY_SAMPLE_SEED" \
+    "+env.validation_task_count=$EVAL_TASK_COUNT" \
     "ray_kwargs.ray_init.num_cpus=$RAY_NUM_CPUS" \
     "ray_kwargs.ray_init.runtime_env.py_executable=$PYTHON_BIN" \
     "+ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH=$PYTHONPATH" \
@@ -207,3 +244,6 @@ if ((status != 0)); then
     exit "$status"
 fi
 printf 'Evaluation complete: %s\n' "$EVAL_DIR"
+if ((TRAJECTORY_SAMPLES_PER_TASK > 0)); then
+    printf 'Markdown trajectory samples: %s/validation_traces/*.md\n' "$EVAL_DIR"
+fi
