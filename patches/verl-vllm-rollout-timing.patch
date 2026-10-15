@@ -1,0 +1,23 @@
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index ec560f65..880a82d0 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -715,6 +715,18 @@ class vLLMHttpServer:
+         # Prefix-cache hit count for this request; consumers surface it as
+         # OpenAI usage.prompt_tokens_details.cached_tokens.
+         extra_fields["num_cached_tokens"] = getattr(final_res, "num_cached_tokens", None)
++        request_metrics = getattr(final_res, "metrics", None)
++        if request_metrics is not None:
++            queued_ts = float(getattr(request_metrics, "queued_ts", 0.0) or 0.0)
++            scheduled_ts = float(getattr(request_metrics, "scheduled_ts", 0.0) or 0.0)
++            first_token_ts = float(getattr(request_metrics, "first_token_ts", 0.0) or 0.0)
++            last_token_ts = float(getattr(request_metrics, "last_token_ts", 0.0) or 0.0)
++            if scheduled_ts >= queued_ts > 0.0:
++                extra_fields["vllm_queue_latency_s"] = scheduled_ts - queued_ts
++            if first_token_ts >= scheduled_ts > 0.0:
++                extra_fields["vllm_prefill_latency_s"] = first_token_ts - scheduled_ts
++            if last_token_ts >= first_token_ts > 0.0:
++                extra_fields["vllm_decode_latency_s"] = last_token_ts - first_token_ts
+         extract_prompt_logprobs(
+             output=final_res,
+             num_prompt_logprobs=sampling_params.prompt_logprobs,

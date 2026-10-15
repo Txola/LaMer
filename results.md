@@ -1,6 +1,6 @@
 # ALFWorld experimental results
 
-Last updated: 2026-09-30
+Last updated: 2026-10-04
 
 This file collects the ALFWorld results discussed during development. Values are
 taken from saved run artifacts whenever those artifacts are available. Results
@@ -20,6 +20,219 @@ recovered only from the conversation are explicitly marked as such.
   otherwise.
 - Sampling is stochastic. Results from separately launched runs are not paired,
   even when their configuration seeds match.
+
+## Qwen3.5-9B integration smoke
+
+The first end-to-end Qwen3.5-9B evaluation smoke completed on one fixed
+balanced126 task using the unchanged 3x10 reflection protocol. This is an
+integration diagnostic, not a baseline estimate.
+
+| Tasks | Category | P@1 | P@2 | P@3 | Runtime |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | Cool then place | 0/1 | 0/1 | 0/1 | 5m 57s |
+
+The full 9.41B checkpoint loaded without OOM. FSDP reported 17.55 GiB allocated
+and 27.32/94.96 GiB total device use immediately after model wrapping. The run
+executed all three attempts, but Qwen3.5 repeatedly generated long visible
+reasoning under the unchanged LaMer instruction to reason before acting. The
+saved final generation reached the exact 1,024-token response cap and contained
+neither `<action>` nor `</action>`; truncated text was consequently projected
+as an invalid environment action. The full baseline below preserves reasoning
+before action and adds Qwen3.5's recommended `1.5` presence penalty, which was
+not present in the original Qwen3 protocol. This smoke must not be interpreted
+as a one-task estimate of model quality.
+
+Source: `outputs/qwen35_9b/smoke_1task_3x10_retry1`.
+
+## Qwen3-4B modern-VERL full-parameter smoke
+
+Two bridge smokes ran the known Qwen3-4B model through the modern VERL ALFWorld
+agent loop and custom GiGPO trainer for one full-parameter update. Each used one
+task, eight independently sampled same-task rollouts, three attempts of ten
+turns, learning rate `1e-6`, token-mean policy loss, entropy coefficient `0.01`,
+and no presence penalty. These are integration and memory diagnostics, not
+evidence of learning.
+
+Both recorded smokes used BF16 resident actor parameters and the provisional
+`0.01` entropy coefficient. After the bridge was validated, the production 4B
+profile was changed to the successful legacy run's FP32 resident actor with
+BF16 mixed-precision compute and `0.001` entropy coefficient. The smoke timing
+and memory measurements below therefore must not be treated as measurements of
+the final 150-update precision profile.
+
+| Result | Activation checkpointing | No activation checkpointing |
+| --- | ---: | ---: |
+| Completed updates | 1/1 | 1/1 |
+| Successful rollouts | 0/8 | 0/8 |
+| Play parse-valid | 238/240 (99.17%) | 239/240 (99.58%) |
+| Play environment-effective | 184/240 (76.67%) | 186/240 (77.50%) |
+| Play response-limit rate | 0/240 | 0/240 |
+| Reflection parse-valid/effective | 16/16 | 16/16 |
+| Entropy | 0.1630 | 0.1517 |
+| Actor gradient norm | 0.4012 | 0.2492 |
+| Rollout-correction KL | 0.00351 | 0.00286 |
+| Rollout-correction effective sample size | 0.9941 | 0.9939 |
+| Actor maximum allocated / reserved | 50.74 / 54.19 GiB | 78.01 / 81.65 GiB |
+| Maximum sampled device use | 71,205 / 97,887 MiB | 85,721 / 97,887 MiB |
+| Host memory reported by actor | 19.25 GiB | 18.54 GiB |
+| Generation / actor update / full step | 64.12s / 48.67s / 123.90s | 60.09s / 41.73s / 112.64s |
+| End-to-end runtime | 5m 55s | 4m 26s |
+
+Both all-failure batches lacked task-success learning signal. Their mean scores,
+`-0.00390625` and `-0.001953125`, are exactly explained by two and one invalid
+records respectively receiving the `-0.5` penalty among 256 play/reflection
+records. Both runs completed weight synchronization and post-update validation.
+W&B runs `wjeoh77f` and `zhk3c145` synchronized successfully; the latter emitted
+a non-fatal `BrokenPipeError` only while closing the already-synchronized W&B
+service at process exit.
+
+Both runs emitted PyTorch's checkpoint warning. Source inspection shows that it
+comes from VERL's forward-only old-policy log-probability pass: the trainer asks
+for entropy, `infer_batch` runs under `torch.no_grad()`, and entropy checkpointing
+therefore receives logits that correctly do not require gradients. The actor
+update is a separate non-forward-only pass and produced finite, nonzero gradient
+norms. Disabling transformer activation checkpointing did not remove the warning,
+which independently confirms that it was not reporting missing transformer
+gradients. The checkpointed profile remains the pilot default: its seven-second
+actor-update cost buys about 14.5 GB more peak device headroom for longer pilot
+sequences.
+
+Sources: `outputs/qwen3_4b_modern/full_gigpo_smoke_bridge` and
+`outputs/qwen3_4b_modern/full_gigpo_smoke_no_checkpoint`.
+
+## Qwen3.5-9B prompting baseline: balanced126
+
+The full Qwen3.5-9B baseline used three attempts of ten turns, reflection,
+thinking disabled, temperature/top-p/top-k `0.7/0.8/20`, presence penalty
+`1.5`, and a 1,024-token response limit. Sixteen concurrent ALFWorld workers
+were used and rollout log-probability collection was disabled because it is not
+consumed by validation metrics.
+
+| Tasks | P@1 | P@2 | P@3 | Gain P@3 - P@1 | Approx. runtime |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 126 | 17/126 (13.49%) | 36/126 (28.57%) | 49/126 (38.89%) | +32 (+25.40 pp) | 12m 02s |
+
+The runtime is reconstructed from the first run-artifact timestamp to the
+validation dump because the wrapper's `elapsed_seconds.txt` was not written.
+The validation dump contains all 126 expected records and no task failures were
+reported by Ray.
+
+Each category contains 21 tasks. Values are cumulative successes.
+
+| Category | P@1 | P@2 | P@3 | Added by attempt 2 | Added by attempt 3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Look at object in light | 8 | 9 | 11 | 1 | 2 |
+| Pick and place | 6 | 15 | 18 | 9 | 3 |
+| Clean then place | 1 | 5 | 7 | 4 | 2 |
+| Cool then place | 0 | 0 | 0 | 0 | 0 |
+| Heat then place | 0 | 0 | 2 | 0 | 2 |
+| Pick two objects and place | 2 | 7 | 11 | 5 | 4 |
+| **Overall** | **17** | **36** | **49** | **19** | **13** |
+
+The final saved generation for every task was retokenized with the pinned
+Qwen3.5 tokenizer. Seventeen of 126 final calls (13.49%) were exactly 1,024
+tokens long; all 17 lacked a complete `<action>...</action>` pair. The six
+task-balanced full trajectory samples contain 154 play/reflection calls: 21
+(13.64%) reached the limit and 133 (86.36%) parsed successfully. These
+trajectory-level percentages are diagnostic estimates from six deterministic
+samples, not measurements over every call in all 126 tasks.
+
+Source: `outputs/qwen35_9b/base_3x10_balanced126_presence15_fast16`.
+
+## Qwen3.5-9B LoRA performance calibration
+
+A realistic one-update calibration used the intended training workload of eight
+tasks with eight same-task rollouts each, three attempts of ten turns, and all
+GiGPO, log-probability, entropy, backward, optimizer, and vLLM adapter-refresh
+stages. Validation and checkpoint writing were deliberately disabled so that
+the measurement isolates a training update. Compiled vLLM execution used a
+0.50 GPU-memory fraction, a 65,536-token batching budget, 64 maximum sequences,
+eight agent workers, log-probability microbatch 8, and gradient plus entropy
+checkpointing.
+
+| Actor microbatch | Outcome | Step time | Generation | Old log probability | Actor update | Peak device memory |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 8 | CUDA OOM during actor backward | n/a | completed | completed | failed | n/a |
+| 4 | completed | 21m 45s | 7m 16s | 3m 30s | 10m 53s | 96,537 / 97,887 MiB |
+
+The successful run processed 2,158,988 tokens at 1,654 tokens/s. External
+telemetry measured 88.0% mean GPU utilization, with utilization at or above 90%
+in 82.6% of samples. Mean power was 537.7 W and peak power was 608.9 W. The
+actor reported 88.85 GiB peak allocated and 91.83 GiB peak reserved memory.
+Because the device-level peak left only about 1.35 GiB free, actor microbatch 4
+is a throughput result rather than a robust long-run setting; microbatch 2 is
+the selected setting for the learning pilot while retaining the successful
+generation and log-probability optimizations.
+
+The update produced eight GiGPO groups: 25% mixed outcome, 50% all failure, and
+25% all success. Valid-action ratio was 81.06%, all real advantage tokens were
+nonzero, PPO KL was 0.000684, clip fraction was 0.432%, gradient norm was 0.361,
+and mean entropy was 0.617. These are single-update diagnostics, not evidence of
+learning. The run had no validation and wrote no checkpoint by design.
+
+Sources: `outputs/qwen35_9b/lora_gigpo_perf_aggressive_fullstep` and
+`outputs/qwen35_9b/lora_gigpo_perf_aggressive_mb4`.
+
+### First full-run launch: host-memory worker loss
+
+The first 150-step launch completed step-zero balanced84 validation and one
+optimizer update, then was manually stopped after a Ray agent death left step
+two permanently at seven of eight completed task groups. Step-zero validation
+was P@1 = 18/84 (21.43%), P@2 = 31/84 (36.90%), and P@3 = 35/84 (41.67%).
+
+At 18:05:53, node memory reached 59.16/62.25 GiB, just above Ray's 95%
+threshold. Ray killed `agent_loop_worker_7`, which used approximately 1.12 GiB,
+and classified its actor lease as non-retriable. The v1 fire-and-forget rollout
+path left that prompt tagged `running`; the other seven groups finished, GPU
+utilization fell to zero, and the replay buffer waited indefinitely. The
+completed step-one metrics remain useful as diagnostics, but no post-update
+checkpoint was written and this run is not a learning result.
+
+The corrected launcher uses four rather than eight task workers, retains eight
+rollouts inside every task group, and fails a rollout batch after a configurable
+30-minute bound rather than accepting partial data or waiting forever.
+
+Source: `outputs/qwen35_9b/lora_gigpo_full150_optimized_mb2`.
+
+### First sustained LoRA run: policy collapse
+
+The memory-corrected 150-step launch was stopped after 22 completed updates
+because the policy had entered a clear low-entropy failure mode. It used LoRA
+rank 16/alpha 32, learning rate `1e-5`, entropy coefficient `0.001`, global
+`token-mean` loss aggregation, and presence penalty `1.5`. These are results
+from the fixed balanced84 ID validation set, not balanced126.
+
+| Step | P@1 | P@2 | P@3 | Actor entropy | Valid actions | Mean response tokens | Responses at 1,024-token cap |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 19.05% | 33.33% | 38.10% | n/a | n/a | n/a | n/a |
+| 5 | 20.24% | 35.71% | **40.48%** | 0.541 | 82.02% | 434 | 17.17% |
+| 10 | 21.43% | 35.71% | 36.90% | 0.428 | 86.94% | 342 | 13.06% |
+| 14 | n/a | n/a | n/a | 0.328 | **96.67%** | 187 | 3.16% |
+| 15 | 15.48% | 25.00% | 29.76% | 0.296 | 88.70% | 269 | 11.02% |
+| 20 | 2.38% | 7.14% | 11.90% | 0.0536 | 47.58% | 585 | 52.65% |
+| 21 | n/a | n/a | n/a | 0.0260 | 24.44% | 796 | 75.46% |
+| 22 | n/a | n/a | n/a | **0.0230** | **27.93%** | **758** | **71.97%** |
+
+The entropy decrease before step 14 is not sufficient by itself to diagnose a
+failure: over the same interval action validity improved and capped responses
+decreased. The interpretation becomes clear after step 14, when entropy,
+validity, response quality, and validation success deteriorate together and
+saved validation text becomes repetitive. The best-checkpoint selector
+correctly retained step 5 at P@3 = 34/84 (40.48%); no later checkpoint replaced
+it. The stopped run lasted 30,531 seconds (8h 28m 51s).
+
+Post-run inspection found two objective mismatches that make this run an
+invalid test of the corrected recipe: presence-penalized vLLM rollout
+probabilities were not used to correct the recomputed actor likelihoods, and
+the modern GiGPO port applied the invalid-action penalty to episode scores but
+not to discounted state returns. The old 4B implementation applied the latter
+penalty to both. The next pilot therefore adds bounded token-level importance
+sampling, restores the state-return penalty, uses equal per-generation loss
+weighting, lowers the LoRA learning rate to `1e-6`, and raises the entropy
+coefficient to `0.01`. Its outcome must be measured; these changes are motivated
+corrections, not yet evidence that collapse is solved.
+
+Source: `outputs/qwen35_9b/lora_gigpo_full150_memoryfix_optimized_mb2`.
 
 ## Presentation evaluation matrix: balanced126
 
