@@ -37,6 +37,17 @@ def _metadata_at(data, key: str, index: int, default=None):
     return _json_value(values[index])
 
 
+def _last_subsequence_end(sequence: list[int], subsequence: list[int]) -> int | None:
+    """Return the exclusive end of the last matching token subsequence."""
+    if not subsequence or len(subsequence) > len(sequence):
+        return None
+    width = len(subsequence)
+    for start in range(len(sequence) - width, -1, -1):
+        if sequence[start : start + width] == subsequence:
+            return start + width
+    return None
+
+
 def collect_validation_interactions(
     data, tokenizer, include_heavy_fields: bool = True
 ) -> list[dict[str, Any]]:
@@ -45,12 +56,15 @@ def collect_validation_interactions(
     prompts = data.batch["prompts"]
     attention_mask = data.batch["attention_mask"]
     response_width = responses.shape[-1]
+    think_open_ids = tokenizer.encode("<think>", add_special_tokens=False)
+    think_close_ids = tokenizer.encode("</think>", add_special_tokens=False)
     records = []
 
     for index in range(len(data)):
         response_mask = attention_mask[index, -response_width:].bool()
         prompt_mask = attention_mask[index, :-response_width].bool()
         response_ids = responses[index][response_mask]
+        response_id_list = response_ids.tolist()
         prompt_ids = prompts[index][prompt_mask]
         response = tokenizer.decode(
             response_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
@@ -59,6 +73,18 @@ def collect_validation_interactions(
         attempt_zero_based = int(_metadata_at(data, "traj_idx", index, -1))
         turn_zero_based = int(_metadata_at(data, "turn_idx", index, -1))
         response_tokens = int(response_mask.sum().item())
+        think_open_end = _last_subsequence_end(response_id_list, think_open_ids)
+        think_close_end = _last_subsequence_end(response_id_list, think_close_ids)
+        has_thinking = think_open_end is not None or think_close_end is not None
+        if think_close_end is not None:
+            thinking_tokens = think_close_end
+        elif think_open_end is not None:
+            # A response that reaches its cap before </think> spent the entire
+            # generation budget in the unfinished thinking section.
+            thinking_tokens = response_tokens
+        else:
+            thinking_tokens = 0
+        final_answer_tokens = response_tokens - thinking_tokens
 
         anchor_obs = _metadata_at(data, "anchor_obs", index)
         next_anchor_obs = _metadata_at(data, "next_anchor_obs", index)
@@ -94,6 +120,12 @@ def collect_validation_interactions(
             "response_tokens": response_tokens,
             "response_token_limit": int(response_width),
             "response_reached_token_limit": response_tokens >= response_width,
+            "has_thinking": has_thinking,
+            "has_complete_thinking": (
+                think_open_end is not None and think_close_end is not None
+            ),
+            "thinking_tokens": thinking_tokens,
+            "final_answer_tokens": final_answer_tokens,
             "has_action_open_tag": "<action>" in response,
             "has_complete_action_tag": "<action>" in response and "</action>" in response,
             "has_complete_reflection_tag": "<remark>" in response and "</remark>" in response,
@@ -130,7 +162,7 @@ def collect_validation_interactions(
         if include_heavy_fields:
             record.update({
                 "prompt_token_ids": prompt_ids.tolist(),
-                "generated_token_ids": response_ids.tolist(),
+                "generated_token_ids": response_id_list,
                 "model_facing_prompt": tokenizer.decode(
                     prompt_ids,
                     skip_special_tokens=False,
@@ -213,6 +245,14 @@ def summarize_validation_interactions(records: list[dict[str, Any]]) -> dict[str
         "val/diagnostics/reflection_response_token_limit_rate": _rate(reflections, lambda row: row["response_reached_token_limit"]),
         "val/diagnostics/mean_play_response_tokens": _mean(row["response_tokens"] for row in plays),
         "val/diagnostics/mean_reflection_response_tokens": _mean(row["response_tokens"] for row in reflections),
+        "val/diagnostics/play_thinking_rate": _rate(plays, lambda row: row["has_thinking"]),
+        "val/diagnostics/reflection_thinking_rate": _rate(reflections, lambda row: row["has_thinking"]),
+        "val/diagnostics/play_complete_thinking_rate": _rate(plays, lambda row: row["has_complete_thinking"]),
+        "val/diagnostics/reflection_complete_thinking_rate": _rate(reflections, lambda row: row["has_complete_thinking"]),
+        "val/diagnostics/mean_play_thinking_tokens": _mean(row["thinking_tokens"] for row in plays),
+        "val/diagnostics/mean_play_final_answer_tokens": _mean(row["final_answer_tokens"] for row in plays),
+        "val/diagnostics/mean_reflection_thinking_tokens": _mean(row["thinking_tokens"] for row in reflections),
+        "val/diagnostics/mean_reflection_final_answer_tokens": _mean(row["final_answer_tokens"] for row in reflections),
         "val/diagnostics/mean_immediate_play_reward": _mean(row["immediate_reward"] for row in plays),
         "val/diagnostics/win_transition_count": sum(row["won"] for row in plays),
         "val/diagnostics/terminal_loss_count": sum(row["done"] and not row["won"] for row in plays),

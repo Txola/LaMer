@@ -17,6 +17,16 @@ from agent_system.environments.alfworld.envs import (
 )
 
 
+ALFWORLD_TASK_TYPES = (
+    "pick_and_place_simple",
+    "look_at_obj_in_light",
+    "pick_clean_then_place_in_recep",
+    "pick_heat_then_place_in_recep",
+    "pick_cool_then_place_in_recep",
+    "pick_two_obj_and_place",
+)
+
+
 def task_type(gamefile: str) -> str:
     trajectory_path = gamefile.replace("game.tw-pddl", "traj_data.json")
     with open(trajectory_path, encoding="utf-8") as stream:
@@ -30,10 +40,37 @@ def games_for_split(config_path: Path, dataset_split: str) -> list[str]:
     return list(environment.game_files)
 
 
+def balanced_game_order(games: list[str], seed: int) -> list[str]:
+    """Shuffle within task types, then interleave all six task types."""
+    buckets = {task: [] for task in ALFWORLD_TASK_TYPES}
+    for game in games:
+        game_task_type = task_type(game)
+        if game_task_type not in buckets:
+            raise ValueError(f"Unexpected ALFWorld task type: {game_task_type}")
+        buckets[game_task_type].append(game)
+
+    missing = [task for task, task_games in buckets.items() if not task_games]
+    if missing:
+        raise ValueError(f"ALFWorld split is missing task types: {', '.join(missing)}")
+
+    rng = np.random.RandomState(seed)
+    task_order = [ALFWORLD_TASK_TYPES[index] for index in rng.permutation(6)]
+    for task_games in buckets.values():
+        rng.shuffle(task_games)
+
+    ordered: list[str] = []
+    offsets = {task: 0 for task in ALFWORLD_TASK_TYPES}
+    while len(ordered) < len(games):
+        for task in task_order:
+            offset = offsets[task]
+            if offset < len(buckets[task]):
+                ordered.append(buckets[task][offset])
+                offsets[task] += 1
+    return ordered
+
+
 def ordered_games(config_path: Path, eval_dataset: str, seed: int) -> list[str]:
-    games = games_for_split(config_path, eval_dataset)
-    permutation = np.random.RandomState(seed).permutation(len(games))
-    return [games[index] for index in permutation]
+    return balanced_game_order(games_for_split(config_path, eval_dataset), seed)
 
 
 def make_rows(
@@ -64,37 +101,37 @@ def make_rows(
 def training_schedule(
     games: list[str], seed: int, batch_size: int, steps: int
 ) -> tuple[list[str], list[dict]]:
-    """Reproduce the legacy launcher's independently shuffled task slots."""
+    """Build a deterministic schedule balanced across the six task types."""
     if batch_size <= 0:
         raise ValueError("training batch size must be positive")
     if steps <= 0:
         raise ValueError("training steps must be positive")
 
-    streams = []
-    for slot in range(batch_size):
-        slot_games = list(games)
-        rng = np.random.RandomState(seed + slot)
-
-        def stream(slot_games=slot_games, rng=rng):
-            while True:
-                rng.shuffle(slot_games)
-                yield from slot_games
-
-        streams.append(stream())
-
     scheduled_games: list[str] = []
-    metadata: list[dict] = []
-    for step in range(steps):
-        for slot, stream in enumerate(streams):
-            scheduled_games.append(next(stream))
-            metadata.append(
-                {
-                    "training_step": step,
-                    "training_slot": slot,
-                    "env_seed_offset": slot,
-                }
-            )
+    epoch = 0
+    target_size = batch_size * steps
+    while len(scheduled_games) < target_size:
+        epoch_games = balanced_game_order(games, seed + epoch)
+        remaining = target_size - len(scheduled_games)
+        scheduled_games.extend(epoch_games[:remaining])
+        epoch += 1
+
+    metadata = [
+        {
+            "training_step": index // batch_size,
+            "training_slot": index % batch_size,
+            "env_seed_offset": index % batch_size,
+        }
+        for index in range(target_size)
+    ]
     return scheduled_games, metadata
+
+
+def task_counts(games: list[str]) -> dict[str, int]:
+    counts = {task: 0 for task in ALFWORLD_TASK_TYPES}
+    for game in games:
+        counts[task_type(game)] += 1
+    return counts
 
 
 def write_parquet(path: Path, rows: list[dict]) -> None:
@@ -158,6 +195,8 @@ def main() -> None:
         "training_steps": args.training_steps,
         "train_batch_size": args.train_batch_size,
         "training_rows": len(scheduled_games),
+        "training_task_counts": task_counts(scheduled_games),
+        "validation_task_counts": task_counts(selected_games),
         "training_games": [
             {
                 **training_metadata[index],

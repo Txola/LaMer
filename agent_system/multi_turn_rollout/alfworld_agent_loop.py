@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,10 @@ from agent_system.environments.alfworld.envs import (
     load_config_file,
 )
 from agent_system.environments.alfworld.projection import alfworld_projection
+from agent_system.environments.alfworld.reflection_recovery import (
+    default_reflection_recovery_metadata,
+    process_reflection_generation,
+)
 from agent_system.multi_turn_rollout.episode_credit import episode_scores_for_records
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.utils.profiler import simple_timer
@@ -38,6 +43,34 @@ def _ordered_evaluation_games(
     base_env = get_environment(env_type)(config, train_eval=eval_dataset)
     permutation = np.random.RandomState(seed).permutation(len(base_env.game_files))
     return tuple(base_env.game_files[index] for index in permutation)
+
+
+def _resolve_evaluation_game(
+    games: tuple[str, ...],
+    index: int,
+    recorded_gamefile: str | None,
+) -> str:
+    """Resolve one validation game while preserving explicit dataset identity.
+
+    New datasets record the exact game selected by the data-preparation layer,
+    whose order may intentionally differ from the legacy seeded permutation.
+    Older datasets without that field retain the index-based fallback.
+    """
+    if recorded_gamefile:
+        recorded_identity = os.path.realpath(str(recorded_gamefile))
+        for candidate in games:
+            if os.path.realpath(candidate) == recorded_identity:
+                return candidate
+        raise ValueError(
+            "Dataset evaluation game is not part of the configured ALFWorld "
+            f"evaluation split: {recorded_gamefile!r}"
+        )
+
+    if index < 0 or index >= len(games):
+        raise IndexError(
+            f"Evaluation index {index} is outside the {len(games)} configured games"
+        )
+    return games[index]
 
 
 @lru_cache(maxsize=None)
@@ -102,6 +135,9 @@ class AlfWorldAgentLoop(AgentLoopBase):
         self.brief_response_instruction = bool(
             self.config.env.get("brief_response_instruction", False)
         )
+        self.recover_truncated_reflection_memory = bool(
+            self.config.env.get("recover_truncated_reflection_memory", False)
+        )
 
         self.validation_trace_dir = str(
             self.config.env.get("validation_trace_dir", "")
@@ -117,6 +153,9 @@ class AlfWorldAgentLoop(AgentLoopBase):
         )
         self.local_env_pool_size = int(
             self.config.env.alfworld.get("local_env_pool_size", 16)
+        )
+        self.profile_rollout = bool(
+            self.config.env.alfworld.get("profile_rollout", False)
         )
         if self.local_env_pool_size <= 0:
             raise ValueError("env.alfworld.local_env_pool_size must be positive")
@@ -201,6 +240,14 @@ class AlfWorldAgentLoop(AgentLoopBase):
             f"- Immediate environment reward: `{environment_reward}`\n"
             f"- Won by this point: `{won}`\n\n"
         )
+        if phase == "reflect":
+            section += (
+                "### Reflection recovery\n\n"
+                "- Recovered from truncation: "
+                f"`{fields['reflection_recovered_from_truncation']}`\n"
+                "- Memory override:\n\n"
+                f"{_markdown_block(fields.get('reflection_memory_override'))}\n\n"
+            )
         self._append_trace(trace_path, section)
 
     def _protocol(self, split: str) -> dict[str, Any]:
@@ -336,12 +383,18 @@ class AlfWorldAgentLoop(AgentLoopBase):
         # its first job.  The same upstream Qwen3.5 processor-backed builder is
         # still used, so this changes scheduling rather than prompt tokens.
         # Tokenization takes milliseconds and is negligible beside generation.
+        prompt_start = time.monotonic() if self.profile_rollout else 0.0
         prompt_ids = self.continuous_token_builder.build_initial_tokens(messages)
         prompt_ids = self._cap_text_prompt_length(prompt_ids)
+        prompt_tokenization_s = (
+            time.monotonic() - prompt_start if self.profile_rollout else None
+        )
 
         metrics: dict[str, Any] = {}
         request_sampling_params = dict(sampling_params)
         request_sampling_params["presence_penalty"] = self.presence_penalty
+        request_start = time.monotonic()
+        worker_cpu_start = time.process_time()
         with simple_timer("generate_sequences", metrics):
             generated: TokenOutput = await self.server_manager.generate(
                 request_id=request_id,
@@ -349,6 +402,8 @@ class AlfWorldAgentLoop(AgentLoopBase):
                 sampling_params=request_sampling_params,
                 priority=priority,
             )
+        request_end = time.monotonic()
+        worker_cpu_end = time.process_time()
         metrics["num_preempted"] = (
             generated.num_preempted if generated.num_preempted is not None else -1
         )
@@ -378,6 +433,9 @@ class AlfWorldAgentLoop(AgentLoopBase):
             response_logprobs = response_logprobs[: self.response_length]
 
         text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+        response_processing_s = (
+            time.monotonic() - request_end if self.profile_rollout else None
+        )
         output = AgentLoopOutput(
             prompt_ids=aligned_prompt_ids,
             response_ids=response_ids,
@@ -393,9 +451,26 @@ class AlfWorldAgentLoop(AgentLoopBase):
                 "phase": phase,
                 "attempt_index": attempt_index,
                 "turn_index": turn_index,
+                "prompt_token_count": len(aligned_prompt_ids),
                 "response_token_count": len(response_ids),
                 "response_token_limit": self.response_length,
-                "response_token_cap_hit": len(response_ids) >= self.response_length,
+                "response_token_cap_hit": len(response_ids) == self.response_length,
+                "request_start_monotonic_s": request_start,
+                "request_end_monotonic_s": request_end,
+                "request_latency_s": request_end - request_start,
+                **(
+                    {
+                        "client_prompt_tokenization_s": prompt_tokenization_s,
+                        "client_response_processing_s": response_processing_s,
+                        "rollout_num_preempted": generated.num_preempted,
+                    }
+                    if self.profile_rollout
+                    else {}
+                ),
+                "rollout_worker_id": os.getpid(),
+                "worker_process_cpu_start_s": worker_cpu_start,
+                "worker_process_cpu_end_s": worker_cpu_end,
+                **default_reflection_recovery_metadata(),
                 **(
                     {"prompt_text": prompt, "response_text": text}
                     if capture_text
@@ -426,17 +501,7 @@ class AlfWorldAgentLoop(AgentLoopBase):
             games = _ordered_evaluation_games(
                 str(config_path), protocol["eval_dataset"], protocol["env_seed"]
             )
-            if index < 0 or index >= len(games):
-                raise IndexError(
-                    f"Evaluation index {index} is outside the {len(games)} games in "
-                    f"{protocol['eval_dataset']}"
-                )
-            gamefile = games[index]
-            if recorded_gamefile and os.path.realpath(recorded_gamefile) != os.path.realpath(gamefile):
-                raise ValueError(
-                    "Dataset game identity does not match the seeded ALFWorld order: "
-                    f"index={index}, dataset={recorded_gamefile!r}, expected={gamefile!r}"
-                )
+            gamefile = _resolve_evaluation_game(games, index, recorded_gamefile)
             environment_split = protocol["eval_dataset"]
         else:
             if not recorded_gamefile:
@@ -450,6 +515,7 @@ class AlfWorldAgentLoop(AgentLoopBase):
             else None
         )
 
+        acquire_start = time.monotonic() if self.profile_rollout else 0.0
         env_pool = get_local_alfworld_env_pool(
             str(config_path),
             environment_split,
@@ -462,6 +528,10 @@ class AlfWorldAgentLoop(AgentLoopBase):
             + int(extra_info.get("env_seed_offset", index)),
             eval_dataset=environment_split,
         )
+        pool_acquire_s = (
+            time.monotonic() - acquire_start if self.profile_rollout else None
+        )
+        manager_start = time.monotonic() if self.profile_rollout else 0.0
         try:
             manager = AlfWorldEnvironmentManager(
                 local_env,
@@ -473,6 +543,9 @@ class AlfWorldAgentLoop(AgentLoopBase):
         except BaseException:
             await env_pool.release(local_env)
             raise
+        manager_init_s = (
+            time.monotonic() - manager_start if self.profile_rollout else None
+        )
 
         outputs: list[AgentLoopOutput] = []
         attempt_successes = [False] * protocol["num_attempts"]
@@ -487,6 +560,15 @@ class AlfWorldAgentLoop(AgentLoopBase):
 
         try:
             observation, _ = manager.reset()
+            initial_profile = (
+                {
+                    "env_pool_acquire_s": pool_acquire_s,
+                    "env_manager_init_s": manager_init_s,
+                    **manager.last_profile_timings,
+                }
+                if self.profile_rollout
+                else {}
+            )
             if trace_path is not None:
                 trace_path.write_text(
                     "# ALFWorld validation trajectory\n\n"
@@ -507,6 +589,11 @@ class AlfWorldAgentLoop(AgentLoopBase):
 
                 if attempt_index > 0 and protocol["do_reflection"]:
                     observation, _ = manager.reflect()
+                    reflection_profile = (
+                        manager.last_profile_timings.copy()
+                        if self.profile_rollout
+                        else {}
+                    )
                     reflection_output, reflection_text = await self._generate_one(
                         observation["text"][0],
                         sampling_params,
@@ -517,9 +604,17 @@ class AlfWorldAgentLoop(AgentLoopBase):
                         0,
                         capture_text=trace_path is not None,
                     )
-                    _, _, _, reflection_infos = manager.step(
-                        [reflection_text], phase="reflect"
+                    reflection_infos = process_reflection_generation(
+                        manager,
+                        reflection_output,
+                        reflection_text,
+                        recovery_enabled=self.recover_truncated_reflection_memory,
                     )
+                    if self.profile_rollout:
+                        reflection_output.extra_fields.update(reflection_profile)
+                        reflection_output.extra_fields.update(
+                            manager.last_profile_timings
+                        )
                     reflection_output.extra_fields.update(
                         {
                             "task_uid": task_uid,
@@ -559,6 +654,13 @@ class AlfWorldAgentLoop(AgentLoopBase):
 
                 if attempt_index > 0:
                     observation, _ = manager.restart()
+                    restart_profile = (
+                        manager.last_profile_timings.copy()
+                        if self.profile_rollout
+                        else {}
+                    )
+                else:
+                    restart_profile = {}
 
                 for turn_index in range(protocol["max_turns"]):
                     anchor_obs = observation["anchor"][0]
@@ -572,9 +674,20 @@ class AlfWorldAgentLoop(AgentLoopBase):
                         turn_index,
                         capture_text=trace_path is not None,
                     )
+                    if self.profile_rollout:
+                        if initial_profile:
+                            play_output.extra_fields.update(initial_profile)
+                            initial_profile = {}
+                        if restart_profile:
+                            play_output.extra_fields.update(restart_profile)
+                            restart_profile = {}
                     observation, rewards, dones, infos = manager.step(
                         [play_text], phase="play"
                     )
+                    if self.profile_rollout:
+                        play_output.extra_fields.update(
+                            manager.last_profile_timings
+                        )
                     info = infos[0]
                     won = won or bool(info.get("won", False))
                     attempt_successes[attempt_index] = won

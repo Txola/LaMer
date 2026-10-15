@@ -1,6 +1,54 @@
 from typing import List
+from dataclasses import dataclass
 import re
 import copy
+
+
+REFLECTION_MEMORY_MAX_CHARACTERS = 2000
+
+
+def normalize_reflection_memory(text: str) -> str:
+    """Apply the existing reflection-memory whitespace and size normalization."""
+    return text.strip()[:REFLECTION_MEMORY_MAX_CHARACTERS]
+
+
+@dataclass(frozen=True, slots=True)
+class TruncatedReflectionRecovery:
+    """Separately expose full extracted text and installed memory override."""
+
+    extracted_text: str
+    memory_override: str
+
+
+def recover_truncated_reflection_memory(
+    response: str,
+    *,
+    phase: str,
+    hard_truncated: bool,
+    enabled: bool,
+) -> TruncatedReflectionRecovery | None:
+    """Recover an unclosed reflection suffix without changing parser validity."""
+    if phase not in {'play', 'reflect'}:
+        raise ValueError(f"Unsupported ALFWorld generation phase: {phase!r}")
+    if not enabled or phase != 'reflect' or not hard_truncated:
+        return None
+
+    start_tag = '<remark>'
+    end_tag = '</remark>'
+    start_idx = response.rfind(start_tag)
+    if start_idx == -1:
+        return None
+    content_start = start_idx + len(start_tag)
+    if response.find(end_tag, content_start) != -1:
+        return None
+
+    extracted_text = response[content_start:].strip()
+    if not extracted_text:
+        return None
+    return TruncatedReflectionRecovery(
+        extracted_text=extracted_text,
+        memory_override=normalize_reflection_memory(extracted_text),
+    )
 
 def alfworld_projection(actions: List[str], action_pools: List[List[str]]=None, phase='play'):
     """
@@ -50,7 +98,9 @@ def alfworld_projection(actions: List[str], action_pools: List[List[str]]=None, 
             if start_idx == -1 or end_idx == -1:
                 reflections[i] = ''
             else:
-                reflections[i] = action[start_idx + len(start_tag):end_idx].strip()[:2000] # max 2000 characters
+                reflections[i] = normalize_reflection_memory(
+                    action[start_idx + len(start_tag):end_idx]
+                )
                 valids[i] = 1
 
         return reflections, valids

@@ -1,5 +1,5 @@
 dataset:
-  data_path: '$ALFWORLD_DATA/json/train_first4'
+  data_path: '$ALFWORLD_DATA/json_2.1.1/train' # official train split; env.task_types selects all six supported tasks
   eval_id_data_path: '$ALFWORLD_DATA/json/valid_first4' # valid_train + valid_seen
   eval_id_checkpoint_data_path: '$ALFWORLD_DATA/json/valid_id_task_balanced84' # 21 per ID task
   eval_ood_data_path: '$ALFWORLD_DATA/json/valid_last2' # valid_train + valid_seen

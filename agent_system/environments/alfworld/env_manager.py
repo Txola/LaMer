@@ -5,6 +5,7 @@ import numpy as np
 from functools import partial
 import os
 import json
+import time
 
 from .prompt import get_alfworld_prompt
 from .memory import SimpleMemory
@@ -67,10 +68,23 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.curr_turn_idx = 0
         self.curr_traj_idx = 0
         self.max_turns = config.env.get('max_turns', 20) 
+        alfworld_config = config.env.get('alfworld', {})
+        self.prompt_history_length = alfworld_config.get(
+            'prompt_history_length', 15
+        )
+        if self.prompt_history_length < 1:
+            raise ValueError("env.alfworld.prompt_history_length must be positive")
+        self.explicit_reasoning_instruction = alfworld_config.get(
+            'explicit_reasoning_instruction', True
+        )
+        self.profile_rollout = bool(alfworld_config.get('profile_rollout', False))
+        self.last_profile_timings: Dict[str, float] = {}
         super().__init__(envs, projection_f, config)       
     
     def reset(self):
+        profile_start = time.monotonic() if self.profile_rollout else 0.0
         text_obs, image_obs, infos = self.envs.reset()
+        environment_end = time.monotonic() if self.profile_rollout else 0.0
         self.gamefile = parse_gamefile(infos)
         self.task_types = parse_tasktype(self.gamefile)
         for info, task_type in zip(infos, self.task_types):
@@ -93,7 +107,13 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.curr_turn_idx = 0
         self.curr_traj_idx = 0 
 
+        prompt_start = time.monotonic() if self.profile_rollout else 0.0
         full_text_obs = self.build_text_obs(self.envs.get_admissible_commands, phase='play')
+        if self.profile_rollout:
+            self.last_profile_timings = {
+                'env_reset_execution_s': environment_end - profile_start,
+                'env_reset_prompt_s': time.monotonic() - prompt_start,
+            }
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
     
     def reflect(self, additional_contexts=None):
@@ -110,10 +130,15 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 'extra.gamefile': self.gamefile[i],
             } for i in range(self.num_processes)]
         
+        prompt_start = time.monotonic() if self.profile_rollout else 0.0
         observations = {
                 'text': self.build_text_obs(phase='reflect'),
                 'image': None,
                 'anchor': ['reflection' for _ in self.build_text_obs(phase='reflect')]
+            }
+        if self.profile_rollout:
+            self.last_profile_timings = {
+                'reflection_prompt_s': time.monotonic() - prompt_start,
             }
 
         return observations, infos
@@ -126,11 +151,19 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
     def restart(self):
         ''' Used for 2nd or N-th attempts '''
+        profile_start = time.monotonic() if self.profile_rollout else 0.0
         text_obs, image_obs, infos = self.envs.restart()
+        environment_end = time.monotonic() if self.profile_rollout else 0.0
         self.curr_traj_idx += 1
         self.curr_turn_idx = 0
         self.pre_text_obs = text_obs
+        prompt_start = time.monotonic() if self.profile_rollout else 0.0
         full_text_obs = self.build_text_obs(self.envs.get_admissible_commands, phase='play')
+        if self.profile_rollout:
+            self.last_profile_timings = {
+                'env_restart_execution_s': environment_end - profile_start,
+                'env_restart_prompt_s': time.monotonic() - prompt_start,
+            }
         for info, task_type in zip(infos, self.task_types):
             info['task_type'] = task_type
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
@@ -157,11 +190,23 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             info['task_type'] = task_type
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
     
-    def step(self, text_actions: List[str], phase: str='play'):
+    def step(
+        self,
+        text_actions: List[str],
+        phase: str='play',
+        reflection_memory_overrides: List[str | None] | None = None,
+    ):
         assert phase in ['play', 'reflect']
         if phase == 'play':
+            if reflection_memory_overrides is not None:
+                raise ValueError(
+                    "reflection_memory_overrides are valid only for reflect phase"
+                )
+            projection_start = time.monotonic() if self.profile_rollout else 0.0
             actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands, phase='play')
+            environment_start = time.monotonic() if self.profile_rollout else 0.0
             text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
+            environment_end = time.monotonic() if self.profile_rollout else 0.0
             
             # add action_valid to infos
             for i, info in enumerate(infos):
@@ -178,7 +223,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                                                     'won': [info['won'] for info in infos]
                                                     })
             self.curr_turn_idx += 1 
+            prompt_start = time.monotonic() if self.profile_rollout else 0.0
             full_text_obs = self.build_text_obs(self.envs.get_admissible_commands, phase=phase)
+            if self.profile_rollout:
+                self.last_profile_timings = {
+                    'env_step_projection_s': environment_start - projection_start,
+                    'env_step_execution_s': environment_end - environment_start,
+                    'env_step_prompt_s': time.monotonic() - prompt_start,
+                }
             if infos[0].get("extra.gamefile") is None:
                 infos = set_gamefile(infos, self.gamefile)
             self.pre_text_obs = text_obs
@@ -189,10 +241,27 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
             return next_observations, rewards, dones, infos
         else:
+            projection_start = time.monotonic() if self.profile_rollout else 0.0
             reflections, valids = self.projection_f(text_actions, phase='reflect')
-            
-            for i, reflection in enumerate(reflections):
-                self.reflections[i][self.curr_traj_idx] = reflection
+            if self.profile_rollout:
+                self.last_profile_timings = {
+                    'reflection_projection_s': time.monotonic() - projection_start,
+                }
+            overrides_supplied = reflection_memory_overrides is not None
+            if reflection_memory_overrides is None:
+                reflection_memory_overrides = [None] * len(reflections)
+            if len(reflection_memory_overrides) != len(reflections):
+                raise ValueError(
+                    "reflection_memory_overrides must match the environment batch"
+                )
+
+            installed_reflections = []
+            for i, (reflection, override) in enumerate(
+                zip(reflections, reflection_memory_overrides, strict=True)
+            ):
+                installed_reflection = reflection if override is None else override
+                self.reflections[i][self.curr_traj_idx] = installed_reflection
+                installed_reflections.append(installed_reflection)
 
             # next_obs, rewards, dones, infos = self.envs.step(actions)
             infos = [{
@@ -206,6 +275,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 info['task_type'] = self.task_types[i]
                 info['diagnostic_parsed_action'] = reflections[i]
                 info['action_is_effective'] = bool(reflections[i])
+                if overrides_supplied:
+                    info['reflection_memory_override'] = reflection_memory_overrides[i]
+                    info['installed_reflection_memory'] = installed_reflections[i]
+                    info['reflection_recovered_from_truncation'] = (
+                        reflection_memory_overrides[i] is not None
+                    )
                 
             next_observations = {
                     'text': '',  
@@ -247,11 +322,15 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         if self.curr_turn_idx == 0:
             curr_trajs = ['' for _ in range(self.num_processes)]
         else:
-            curr_trajs, _ = self.memories[self.curr_traj_idx].fetch(history_length=15)
+            curr_trajs, _ = self.memories[self.curr_traj_idx].fetch(
+                history_length=self.prompt_history_length
+            )
 
         past_trajs = [{} for _ in range(self.num_processes)]
         for traj_idx in range(self.curr_traj_idx):
-            trajectories, _ = self.memories[traj_idx].fetch(history_length=15)
+            trajectories, _ = self.memories[traj_idx].fetch(
+                history_length=self.prompt_history_length
+            )
             for i in range(self.num_processes):
                 past_trajs[i][traj_idx] = trajectories[i]
 
@@ -277,6 +356,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     if phase == 'play'
                     else self.additional_reflection_contexts[i]
                 ),
+                explicit_reasoning_instruction=self.explicit_reasoning_instruction,
             )
 
             postprocess_text_obs.append(obs)

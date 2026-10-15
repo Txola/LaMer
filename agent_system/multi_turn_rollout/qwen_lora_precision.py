@@ -15,16 +15,19 @@ adapter layouts instead of silently applying a partially compatible patch.
 from __future__ import annotations
 
 import gc
+import json
 import os
 import re
 from collections import Counter
 from dataclasses import dataclass
 from functools import wraps
+from pathlib import Path
 
 import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from verl.utils.fs import copy_to_local
+from verl.utils.metric import Metric
 from verl.utils.py_functional import convert_to_regular_types
 from verl.workers.engine.base import EngineRegistry
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
@@ -102,6 +105,41 @@ _FORBIDDEN_TRAINABLE_FRAGMENTS = (
     ".embed_tokens.",
     ".lm_head.",
 )
+_META_PPO_MINIBATCH_UPDATE = (
+    os.environ.get("LAMER_META_PPO_MINIBATCH_UPDATE", "0") == "1"
+)
+_META_INTEGRATION_AUDIT_DIR = os.environ.get("LAMER_META_INTEGRATION_AUDIT_DIR")
+
+
+def _local_parameter_tensor(parameter: torch.Tensor) -> torch.Tensor:
+    """Return the rank-local tensor for ordinary tensors or DTensors."""
+    value = parameter.detach()
+    to_local = getattr(value, "to_local", None)
+    return to_local() if callable(to_local) else value
+
+
+def _json_numbers(value):
+    """Convert nested metric containers to JSON-safe Python values."""
+    if isinstance(value, Metric):
+        return {
+            "aggregation": value.aggregation.value,
+            "values": [_json_numbers(item) for item in value.values],
+            "aggregate": _json_numbers(value.aggregate()),
+        }
+    if isinstance(value, torch.Tensor):
+        value = value.detach().float().cpu()
+        return value.item() if value.numel() == 1 else value.tolist()
+    if isinstance(value, dict):
+        return {str(key): _json_numbers(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_numbers(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _nested_row_sums(value: torch.Tensor) -> list[float]:
+    return [float(row.detach().float().sum().cpu()) for row in value.unbind()]
 
 
 def _process_rss_gib() -> float | None:
@@ -178,6 +216,19 @@ class QwenFP32LoRAFSDPEngine(FSDPEngineWithLMHead):
 
     _optimizer_precision_audited = False
 
+    def train_mode(self, **kwargs):
+        """Avoid redundant context-exit zeroing for each meta PPO minibatch.
+
+        ``BaseEngine.train_batch`` already zeros once before backward. VERL's
+        nested training contexts normally call ``optimizer_zero_grad`` again on
+        each successful exit. In the meta protocol we suppress those cleanup
+        calls and release gradients explicitly after each PPO-minibatch
+        optimizer step. Exceptions retain the upstream emergency cleanup.
+        """
+        if _META_PPO_MINIBATCH_UPDATE:
+            kwargs.setdefault("zero_grad_on_exit", False)
+        return super().train_mode(**kwargs)
+
     def _build_lora_module(self, module):
         if self.engine_config.strategy != "fsdp2":
             raise RuntimeError("FP32 LoRA requires actor.strategy=fsdp2")
@@ -233,7 +284,153 @@ class QwenFP32LoRAFSDPEngine(FSDPEngineWithLMHead):
             self._audit_lora_model(module, stage="after FSDP2")
         return module
 
+    def _pilot_append(self, payload: dict) -> None:
+        if not _META_INTEGRATION_AUDIT_DIR:
+            return
+        destination = Path(_META_INTEGRATION_AUDIT_DIR)
+        destination.mkdir(parents=True, exist_ok=True)
+        rank = int(getattr(self, "rank", 0))
+        with (destination / f"worker_rank_{rank}.jsonl").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(json.dumps(_json_numbers(payload), sort_keys=True) + "\n")
+
+    def optimizer_zero_grad(self):
+        if _META_INTEGRATION_AUDIT_DIR and hasattr(self, "_pilot_events"):
+            self._pilot_events.append("zero_grad")
+        return super().optimizer_zero_grad()
+
+    def forward_step(self, micro_batch, loss_function, forward_only):
+        if (
+            _META_INTEGRATION_AUDIT_DIR
+            and not forward_only
+            and hasattr(self, "_pilot_events")
+        ):
+            fragment_index = len(self._pilot_fragments)
+            self._pilot_events.append(f"forward_backward_fragment:{fragment_index + 1}")
+            parameter_versions = [
+                int(parameter._version)
+                for parameter in self.module.parameters()
+                if parameter.requires_grad
+            ]
+            adam_steps = []
+            for parameter in self.module.parameters():
+                if not parameter.requires_grad:
+                    continue
+                step = self.optimizer.state.get(parameter, {}).get("step", 0.0)
+                adam_steps.append(float(step.detach().cpu()) if torch.is_tensor(step) else float(step))
+            row_indices = (
+                micro_batch["meta_record_row_index"].detach().cpu().tolist()
+                if "meta_record_row_index" in micro_batch
+                else []
+            )
+            input_ids = micro_batch.get("input_ids")
+            if input_ids is None:
+                input_token_count = 0
+            elif input_ids.is_nested:
+                input_token_count = int(input_ids.offsets().diff().sum().cpu())
+            else:
+                attention_mask = micro_batch.get("attention_mask")
+                input_token_count = int(
+                    attention_mask.sum().detach().cpu()
+                    if attention_mask is not None
+                    else input_ids.numel()
+                )
+            self._pilot_fragments.append(
+                {
+                    "fragment_index": fragment_index,
+                    "row_indices": row_indices,
+                    "input_token_count": input_token_count,
+                    "parameter_version_min": min(parameter_versions, default=0),
+                    "parameter_version_max": max(parameter_versions, default=0),
+                    "adam_step_min": min(adam_steps, default=0.0),
+                    "adam_step_max": max(adam_steps, default=0.0),
+                }
+            )
+        return super().forward_step(micro_batch, loss_function, forward_only)
+
+    def train_batch(self, data, loss_function):
+        if not _META_INTEGRATION_AUDIT_DIR:
+            return super().train_batch(data, loss_function)
+
+        minibatch_index = int(getattr(self, "_pilot_minibatch_index", 0))
+        self._pilot_events = []
+        self._pilot_fragments = []
+        self._pilot_scheduler_steps_this_minibatch = 0
+        trainable = [
+            parameter for parameter in self.module.parameters() if parameter.requires_grad
+        ]
+        before = [_local_parameter_tensor(parameter).clone() for parameter in trainable]
+        row_indices = data["meta_record_row_index"].detach().cpu().tolist()
+        attached_fields = {}
+        for field in (
+            "meta_trajectory_utility",
+            "meta_base_advantage",
+            "meta_final_unweighted_advantage",
+            "meta_trajectory_weight",
+            "meta_trainable_token_count",
+            "meta_ppo_minibatch_scale",
+        ):
+            attached_fields[field] = data[field].detach().cpu().tolist()
+        old_log_prob_sums = _nested_row_sums(data["old_log_probs"])
+        response_token_counts = [
+            int(row.detach().sum().cpu()) for row in data["response_mask"].unbind()
+        ]
+        memory_before = torch.cuda.memory_allocated()
+        reserved_before = torch.cuda.memory_reserved()
+
+        output = super().train_batch(data, loss_function)
+
+        update_squared = 0.0
+        for parameter, snapshot in zip(trainable, before, strict=True):
+            difference = _local_parameter_tensor(parameter).float() - snapshot.float()
+            update_squared += float(difference.square().sum().cpu())
+        del before
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        grad_norm_values = output.get("metrics", {}).get("grad_norm", [])
+        if isinstance(grad_norm_values, (int, float)):
+            grad_norm = float(grad_norm_values)
+        elif grad_norm_values:
+            grad_norm = float(grad_norm_values[-1])
+        else:
+            grad_norm = float("nan")
+        clip_threshold = float(self.optimizer_config.clip_grad)
+        payload = {
+            "kind": "ppo_minibatch",
+            "minibatch_index": minibatch_index,
+            "row_indices": row_indices,
+            "response_token_counts": response_token_counts,
+            "real_rows": sum(count > 0 for count in response_token_counts),
+            "padding_rows": sum(count == 0 for count in response_token_counts),
+            "attached_fields": attached_fields,
+            "old_log_prob_sums": old_log_prob_sums,
+            "loss": float(sum(output.get("loss", []))),
+            "metrics": output.get("metrics", {}),
+            "pre_clip_grad_norm": grad_norm,
+            "grad_clip_threshold": clip_threshold,
+            "grad_clipping_activated": grad_norm > clip_threshold,
+            "parameter_update_norm": update_squared**0.5,
+            "scheduler_steps": self._pilot_scheduler_steps_this_minibatch,
+            "events": self._pilot_events,
+            "fragments": self._pilot_fragments,
+            "dynamic_batching": bool(self.engine_config.use_dynamic_bsz),
+            "max_token_len_per_gpu": int(
+                self.engine_config.max_token_len_per_gpu or 0
+            ),
+            "cuda_allocated_before": memory_before,
+            "cuda_reserved_before": reserved_before,
+            "cuda_peak_allocated": torch.cuda.max_memory_allocated(),
+            "cuda_peak_reserved": torch.cuda.max_memory_reserved(),
+            "global_free_vram": free_bytes,
+            "global_total_vram": total_bytes,
+        }
+        self._pilot_append(payload)
+        self._pilot_minibatch_index = minibatch_index + 1
+        return output
+
     def optimizer_step(self):
+        if _META_INTEGRATION_AUDIT_DIR and hasattr(self, "_pilot_events"):
+            self._pilot_events.append("global_clip")
         if self._is_lora and not self._optimizer_precision_audited:
             trainable_with_grad = [
                 (name, parameter)
@@ -254,6 +451,19 @@ class QwenFP32LoRAFSDPEngine(FSDPEngineWithLMHead):
                 )
 
         grad_norm = super().optimizer_step()
+
+        if _META_INTEGRATION_AUDIT_DIR and hasattr(self, "_pilot_events"):
+            self._pilot_events.append("optimizer_step")
+
+        if _META_PPO_MINIBATCH_UPDATE:
+            # Pinned VERL normally advances the scheduler only on the final PPO
+            # minibatch of a rollout. Checkpoint 4B defines scheduler cadence at
+            # the optimizer boundary instead. Advance immediately after every
+            # Adam step, and let the worker's final callback only report this LR.
+            self._meta_last_scheduler_lr = super().lr_scheduler_step()
+            if _META_INTEGRATION_AUDIT_DIR and hasattr(self, "_pilot_events"):
+                self._pilot_events.append("scheduler_step")
+                self._pilot_scheduler_steps_this_minibatch += 1
 
         if self._is_lora and not self._optimizer_precision_audited:
             missing_state = []
@@ -288,7 +498,24 @@ class QwenFP32LoRAFSDPEngine(FSDPEngineWithLMHead):
                     "parameters, exp_avg, and exp_avg_sq."
                 )
 
+        if _META_PPO_MINIBATCH_UPDATE:
+            # Release gradient storage without a second optimizer.zero_grad()
+            # event. The next PPO minibatch still begins with BaseEngine's
+            # single explicit zero_grad before any backward fragment.
+            for parameter in self.module.parameters():
+                parameter.grad = None
+
         return grad_norm
+
+    def lr_scheduler_step(self):
+        """Report the LR already advanced after the final PPO-minibatch step."""
+        if not _META_PPO_MINIBATCH_UPDATE:
+            return super().lr_scheduler_step()
+        if not hasattr(self, "_meta_last_scheduler_lr"):
+            raise RuntimeError(
+                "Meta PPO scheduler reporting occurred before an optimizer step"
+            )
+        return self._meta_last_scheduler_lr
 
     def _audit_lora_model(self, module, *, stage: str) -> None:
         profile = self._lora_architecture_profile

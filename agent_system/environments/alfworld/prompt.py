@@ -7,9 +7,17 @@ Your admissible actions of the current situation are:
 
 Now it's your turn to take an action.
 
-- Your response should first by step-by-step reasoning about the current situation.
-- Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+{response_instructions}
 """
+
+
+ALFWORLD_PLAY_EXPLICIT_REASONING_INSTRUCTIONS = """\
+- Your response should first by step-by-step reasoning about the current situation.
+- Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
+
+
+ALFWORLD_PLAY_NATIVE_THINKING_INSTRUCTIONS = """\
+- Choose one admissible action for the current step and present it within <action> </action> tags."""
 
 
 ALFWORLD_REFLECT_PROMPT = """
@@ -25,10 +33,19 @@ The task is NOT successfully completed.
 
 Now it's your turn to reflect on the past experience and come up with a new plan of action.
 
+{response_instructions}
+"""
+
+
+ALFWORLD_REFLECT_EXPLICIT_REASONING_INSTRUCTIONS = """\
 - Your response should first be step-by-step reasoning about the strategy and path you took to attempt to complete the task. Identify where things went wrong or could be better.
 - Then devise a concise, new plan of action that accounts for your mistake with reference to specific actions that you should have taken.
-- Finally, end the response with your reflection and improved plan inside <remark> </remark> tags, to guide the next trial.
-"""
+- Finally, end the response with your reflection and improved plan inside <remark> </remark> tags, to guide the next trial."""
+
+
+ALFWORLD_REFLECT_NATIVE_THINKING_INSTRUCTIONS = """\
+- Devise a concise, improved plan that identifies what went wrong and the specific actions that should be taken instead.
+- End the response with your reflection and improved plan inside <remark> </remark> tags, to guide the next trial."""
 
 # Prompt templates for parsing past trajectories and reflections
 PAST_TRAJECTORY_AND_REFLECTION_TEMPLATE = '''
@@ -210,6 +227,7 @@ def get_alfworld_prompt(phase: str = 'play',
                         reflection: str='',
                         reflection_type: str='reflection_only',
                         additional_context: str='',
+                        explicit_reasoning_instruction: bool=True,
                         ):
     assert phase in ['play', 'reflect']
     if phase == 'play':
@@ -222,6 +240,11 @@ def get_alfworld_prompt(phase: str = 'play',
             additional_context=additional_context,
             current_trajectory=current_trajectory,
             admissible_actions=admissible_actions,
+            response_instructions=(
+                ALFWORLD_PLAY_EXPLICIT_REASONING_INSTRUCTIONS
+                if explicit_reasoning_instruction
+                else ALFWORLD_PLAY_NATIVE_THINKING_INSTRUCTIONS
+            ),
         )
 
     else:
@@ -230,6 +253,11 @@ def get_alfworld_prompt(phase: str = 'play',
             init_observation=init_observation,
             current_trajectory=current_trajectory,
             additional_context=additional_context,
+            response_instructions=(
+                ALFWORLD_REFLECT_EXPLICIT_REASONING_INSTRUCTIONS
+                if explicit_reasoning_instruction
+                else ALFWORLD_REFLECT_NATIVE_THINKING_INSTRUCTIONS
+            ),
         )
 
     return prompt.strip()

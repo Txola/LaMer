@@ -19,11 +19,25 @@ VAL_ENV_SEED=${VAL_ENV_SEED:-1000}
 ROLLOUT_SEED=${ROLLOUT_SEED:-20}
 NUM_ATTEMPTS=${NUM_ATTEMPTS:-3}
 MAX_TURNS_PER_ATTEMPT=${MAX_TURNS_PER_ATTEMPT:-10}
+PROMPT_HISTORY_LENGTH=${PROMPT_HISTORY_LENGTH:-15}
 DO_REFLECTION=${DO_REFLECTION:-True}
 REFLECTION_TYPE=${REFLECTION_TYPE:-reflection_only}
-EVAL_TEMPERATURE=${EVAL_TEMPERATURE:-0.7}
-EVAL_TOP_P=${EVAL_TOP_P:-0.8}
+ENABLE_THINKING=${ENABLE_THINKING:-False}
+EXPLICIT_REASONING_INSTRUCTION=${EXPLICIT_REASONING_INSTRUCTION:-True}
+if [[ "$ENABLE_THINKING" == "True" ]]; then
+    DEFAULT_EVAL_TEMPERATURE=0.6
+    DEFAULT_EVAL_TOP_P=0.95
+else
+    DEFAULT_EVAL_TEMPERATURE=0.7
+    DEFAULT_EVAL_TOP_P=0.8
+fi
+EVAL_TEMPERATURE=${EVAL_TEMPERATURE:-$DEFAULT_EVAL_TEMPERATURE}
+EVAL_TOP_P=${EVAL_TOP_P:-$DEFAULT_EVAL_TOP_P}
 EVAL_TOP_K=${EVAL_TOP_K:-20}
+EVAL_MIN_P=${EVAL_MIN_P:-0.0}
+EVAL_PRESENCE_PENALTY=${EVAL_PRESENCE_PENALTY:-0.0}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1024}
 TRAJECTORY_SAMPLES_PER_TASK=${TRAJECTORY_SAMPLES_PER_TASK:-1}
 TRAJECTORY_SAMPLE_SEED=${TRAJECTORY_SAMPLE_SEED:-0}
 DUMP_ALL_INTERACTIONS=${DUMP_ALL_INTERACTIONS:-False}
@@ -87,8 +101,26 @@ if (( MAX_TURNS_PER_ATTEMPT < 1 )); then
     printf 'MAX_TURNS_PER_ATTEMPT must be positive; got %s\n' "$MAX_TURNS_PER_ATTEMPT" >&2
     exit 2
 fi
+if (( PROMPT_HISTORY_LENGTH < 1 )); then
+    printf 'PROMPT_HISTORY_LENGTH must be positive; got %s\n' "$PROMPT_HISTORY_LENGTH" >&2
+    exit 2
+fi
+if (( MAX_PROMPT_LENGTH < 1 || MAX_RESPONSE_LENGTH < 1 )); then
+    printf 'MAX_PROMPT_LENGTH and MAX_RESPONSE_LENGTH must be positive; got %s and %s\n' \
+        "$MAX_PROMPT_LENGTH" "$MAX_RESPONSE_LENGTH" >&2
+    exit 2
+fi
 if [[ "$DO_REFLECTION" != "True" && "$DO_REFLECTION" != "False" ]]; then
     printf 'DO_REFLECTION must be True or False; got %s\n' "$DO_REFLECTION" >&2
+    exit 2
+fi
+if [[ "$ENABLE_THINKING" != "True" && "$ENABLE_THINKING" != "False" ]]; then
+    printf 'ENABLE_THINKING must be True or False; got %s\n' "$ENABLE_THINKING" >&2
+    exit 2
+fi
+if [[ "$EXPLICIT_REASONING_INSTRUCTION" != "True" && "$EXPLICIT_REASONING_INSTRUCTION" != "False" ]]; then
+    printf 'EXPLICIT_REASONING_INSTRUCTION must be True or False; got %s\n' \
+        "$EXPLICIT_REASONING_INSTRUCTION" >&2
     exit 2
 fi
 if [[ "$DUMP_ALL_INTERACTIONS" != "True" && "$DUMP_ALL_INTERACTIONS" != "False" ]]; then
@@ -197,10 +229,16 @@ NUM_ATTEMPTS=$NUM_ATTEMPTS
 DO_REFLECTION=$DO_REFLECTION
 REFLECTION_TYPE=$REFLECTION_TYPE
 MAX_TURNS_PER_ATTEMPT=$MAX_TURNS_PER_ATTEMPT
+PROMPT_HISTORY_LENGTH=$PROMPT_HISTORY_LENGTH
+ENABLE_THINKING=$ENABLE_THINKING
+EXPLICIT_REASONING_INSTRUCTION=$EXPLICIT_REASONING_INSTRUCTION
 EVAL_TEMPERATURE=$EVAL_TEMPERATURE
 EVAL_TOP_P=$EVAL_TOP_P
 EVAL_TOP_K=$EVAL_TOP_K
-ENABLE_THINKING=False
+EVAL_MIN_P=$EVAL_MIN_P
+EVAL_PRESENCE_PENALTY=$EVAL_PRESENCE_PENALTY
+MAX_PROMPT_LENGTH=$MAX_PROMPT_LENGTH
+MAX_RESPONSE_LENGTH=$MAX_RESPONSE_LENGTH
 TRAJECTORY_SAMPLES_PER_TASK=$TRAJECTORY_SAMPLES_PER_TASK
 TRAJECTORY_SAMPLE_SEED=$TRAJECTORY_SAMPLE_SEED
 DUMP_ALL_INTERACTIONS=$DUMP_ALL_INTERACTIONS
@@ -218,6 +256,13 @@ EOF
 
 printf 'Evaluating %s on %s fixed balanced ALFWorld tasks (validation seed %s, rollout seed %s, profile %s)\n' \
     "$MODEL_PATH" "$EVAL_TASK_COUNT" "$VAL_ENV_SEED" "$ROLLOUT_SEED" "$HARDWARE_PROFILE"
+printf 'Reasoning controls: native thinking=%s, explicit reasoning instruction=%s\n' \
+    "$ENABLE_THINKING" "$EXPLICIT_REASONING_INSTRUCTION"
+printf 'Evaluation sampler: temperature=%s, top-p=%s, top-k=%s, min-p=%s, presence penalty=%s\n' \
+    "$EVAL_TEMPERATURE" "$EVAL_TOP_P" "$EVAL_TOP_K" "$EVAL_MIN_P" \
+    "$EVAL_PRESENCE_PENALTY"
+printf 'Token limits: prompt=%s, response=%s\n' \
+    "$MAX_PROMPT_LENGTH" "$MAX_RESPONSE_LENGTH"
 started=$(date +%s)
 set +e
 "$PYTHON_BIN" -m verl.trainer.main_ppo \
@@ -226,15 +271,15 @@ set +e
     "data.val_files=$EVAL_DIR/data/text/test.parquet" \
     data.train_batch_size=1 \
     "data.val_batch_size=$EVAL_TASK_COUNT" \
-    data.max_prompt_length=4096 \
-    data.max_response_length=1024 \
+    "data.max_prompt_length=$MAX_PROMPT_LENGTH" \
+    "data.max_response_length=$MAX_RESPONSE_LENGTH" \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     data.return_raw_chat=True \
     data.shuffle=False \
     "+data.seed=$ROLLOUT_SEED" \
     "actor_rollout_ref.model.path=$MODEL_PATH" \
-    +actor_rollout_ref.model.enable_thinking=False \
+    "+actor_rollout_ref.model.enable_thinking=$ENABLE_THINKING" \
     actor_rollout_ref.model.lora_rank=0 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=1 \
@@ -256,6 +301,8 @@ set +e
     "actor_rollout_ref.rollout.enforce_eager=$ENFORCE_EAGER" \
     actor_rollout_ref.rollout.free_cache_engine=False \
     +actor_rollout_ref.rollout.capture_generation_diagnostics=True \
+    "+actor_rollout_ref.rollout.min_p=$EVAL_MIN_P" \
+    "+actor_rollout_ref.rollout.presence_penalty=$EVAL_PRESENCE_PENALTY" \
     "actor_rollout_ref.rollout.val_kwargs.temperature=$EVAL_TEMPERATURE" \
     "actor_rollout_ref.rollout.val_kwargs.top_p=$EVAL_TOP_P" \
     "actor_rollout_ref.rollout.val_kwargs.top_k=$EVAL_TOP_K" \
@@ -279,6 +326,8 @@ set +e
     env.max_steps=30 \
     "env.max_turns=$MAX_TURNS_PER_ATTEMPT" \
     "+env.reflection_type=$REFLECTION_TYPE" \
+    "+env.alfworld.prompt_history_length=$PROMPT_HISTORY_LENGTH" \
+    "+env.alfworld.explicit_reasoning_instruction=$EXPLICIT_REASONING_INSTRUCTION" \
     "env.alfworld.eval_dataset=$EVAL_DATASET" \
     "env.alfworld.games_per_worker=$GAMES_PER_ENV_WORKER" \
     "env.resources_per_worker.num_cpus=$ENV_CPUS_PER_WORKER" \
